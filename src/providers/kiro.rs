@@ -107,6 +107,7 @@ impl KiroProvider {
     ) -> Result<reqwest::Response, ProviderError> {
         let model = resolve_model(body.model.as_deref().unwrap_or_default())?;
         body.model = Some(model.clone());
+        normalize_system_messages(&mut body)?;
         // Read once per request: a manual swap never changes an in-flight stream.
         let account = self.active_account().await?;
         if let Some(monitor) = &ctx.monitor {
@@ -205,6 +206,57 @@ impl KiroProvider {
         .await;
         result.unwrap_or_else(error_response)
     }
+}
+
+fn normalize_system_messages(body: &mut MessagesRequest) -> Result<(), ProviderError> {
+    if !body.messages.iter().any(|message| message.role == "system") {
+        return Ok(());
+    }
+    // Claude/Caveman may embed system instructions in the message history.
+    // Anthropic's native schema puts these in the top-level system field.
+    let mut blocks = Vec::new();
+    if let Some(system) = body.extra.remove("system") {
+        append_system_blocks(&mut blocks, system)?;
+    }
+    let mut messages = Vec::new();
+    for message in std::mem::take(&mut body.messages) {
+        if message.role == "system" {
+            append_system_blocks(&mut blocks, message.content)?;
+        } else {
+            messages.push(message);
+        }
+    }
+    body.messages = messages;
+    body.extra
+        .insert("system".into(), serde_json::Value::Array(blocks));
+    Ok(())
+}
+
+fn append_system_blocks(
+    blocks: &mut Vec<serde_json::Value>,
+    content: serde_json::Value,
+) -> Result<(), ProviderError> {
+    match content {
+        serde_json::Value::String(text) => {
+            blocks.push(serde_json::json!({"type": "text", "text": text}));
+        }
+        serde_json::Value::Array(items)
+            if items.iter().all(|item| {
+                item.get("type").and_then(|value| value.as_str()) == Some("text")
+                    && item.get("text").is_some_and(|value| value.is_string())
+            }) =>
+        {
+            blocks.extend(items);
+        }
+        _ => {
+            return Err(ProviderError::new(
+                StatusCode::BAD_REQUEST,
+                ProviderErrorKind::InvalidRequest,
+                "Kiro system instructions must contain text or text blocks.",
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub fn advertised_models() -> Vec<String> {

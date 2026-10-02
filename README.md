@@ -6,7 +6,8 @@ Caveman in front, and a manual swapper for your paid Kiro accounts.
 
 ```powershell
 python scripts/stack.py setup
-# Sign in through Kiro, then save that account:
+# Sign in through Kiro CLI, then save that account:
+kiro-cli login
 python scripts/stack.py account add paid-a
 ./scripts/install.ps1
 
@@ -24,7 +25,9 @@ in a separate terminal. Closing the dashboard leaves the services running.
 Open it manually with `python scripts/stack.py monitor`.
 
 ```powershell
-# Sign in to another paid account through Kiro, then:
+# Sign in to another paid account through Kiro CLI, then:
+kiro-cli logout
+kiro-cli login
 kiro-account add paid-b
 kiro-account list
 kiro-account use paid-b
@@ -34,6 +37,8 @@ kiro-account delete paid-a
 
 Swaps affect new Kiro requests. Existing streams finish on their original account.
 Accounts do not rotate automatically. Saved credentials stay outside the repo.
+Imports prefer the installed Kiro CLI store and reject duplicate credentials.
+For Kiro IDE accounts, pass `--creds` with the IDE token JSON path.
 Deleting an account stops its gateway and interrupts its active responses.
 Deleting the active account clears selection; use `kiro-account use <name>` to
 select another one. Chrome profiles and the Kiro installation login are preserved.

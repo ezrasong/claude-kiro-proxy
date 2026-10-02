@@ -91,10 +91,13 @@ once, under its own name. Names are local labels; models and subscription access
 come from the imported account, not from its name.
 
 ```powershell
-# Sign in to your first paid account in Kiro:
+# Sign in to your first paid account in Kiro CLI:
+kiro-cli login
 kiro-account add paid-a
 
-# Sign out and sign in to the second account in Kiro, then:
+# Sign out and sign in to the second account in Kiro CLI:
+kiro-cli logout
+kiro-cli login
 kiro-account add paid-b
 
 kiro-account list
@@ -125,10 +128,16 @@ kiro-account add work --creds 'C:/path/to/kiro-auth-token.json'
 kiro-account add cli --sqlite 'C:/path/to/data.sqlite3'
 ```
 
-The default source is `~/.aws/sso/cache/kiro-auth-token.json`. JSON imports include
-matching AWS device registration for enterprise/SSO accounts. SQLite imports use
-the database backup API to copy a live database consistently. Saved copies receive
-refreshed tokens; changing the IDE's signed-in account does not overwrite them.
+The default source is the Kiro CLI store when present: `%LOCALAPPDATA%/Kiro-Cli/data.sqlite3`
+on Windows and `$XDG_DATA_HOME/kiro-cli/data.sqlite3` (default `~/.local/share`) on
+macOS/Linux. A logged-out CLI store produces an error instead of silently importing
+an IDE login. Use `--creds ~/.aws/sso/cache/kiro-auth-token.json` explicitly for the
+IDE; this is also the fallback when no CLI store exists. JSON imports include
+matching AWS device registration for enterprise/SSO accounts. SQLite imports read
+the login in one transaction and export only authentication fields into a private
+gateway JSON snapshot; CLI conversations and history are not copied. Identical
+refresh credentials cannot be imported under a second name. Saved copies receive
+refreshed tokens; changing the CLI or IDE login does not overwrite them.
 If an imported login is revoked or cannot refresh, sign in again and import it
 under a new name, then select that name. Stop the stack before editing or restoring
 saved credentials yourself.

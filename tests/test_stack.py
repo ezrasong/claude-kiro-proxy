@@ -1,10 +1,12 @@
 """Controller tests run without provider credentials or paid API calls."""
 import importlib.util
+from contextlib import closing
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
 import subprocess
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -53,6 +55,7 @@ class StackTests(unittest.TestCase):
 
     def test_delete_inactive_and_active_accounts_preserves_source_and_manual_selection(self):
         stack.add_account("a", self.creds)
+        self.creds.write_text(json.dumps({"refreshToken": "account-b-token"}))
         stack.add_account("b", self.creds)
         folder = stack.state_dir() / "accounts" / "b"
         (folder / "gateway.log").write_text("private account log")
@@ -73,6 +76,7 @@ class StackTests(unittest.TestCase):
 
     def test_delete_stops_only_owned_worker_before_removing_files(self):
         stack.add_account("a", self.creds)
+        self.creds.write_text(json.dumps({"refreshToken": "account-b-token"}))
         stack.add_account("b", self.creds)
         registry = stack.read_accounts()
         registry["accounts"]["b"]["deleting"] = True
@@ -129,6 +133,73 @@ class StackTests(unittest.TestCase):
         saved = json.loads(Path(stack.read_accounts()["accounts"]["enterprise"]["credentialsFile"]).read_text())
         self.assertEqual(saved["clientSecret"], "secret")
         self.assertNotIn("clientIdHash", saved)
+
+    def cli_database(self):
+        database = self.root / "cli.sqlite3"
+        with closing(sqlite3.connect(database)) as connection, connection:
+            connection.execute("CREATE TABLE auth_kv (key TEXT PRIMARY KEY, value TEXT)")
+            connection.execute("CREATE TABLE state (key TEXT PRIMARY KEY, value TEXT)")
+            connection.execute("CREATE TABLE conversations (body TEXT)")
+            connection.execute("INSERT INTO conversations VALUES ('private chat history')")
+            connection.execute("INSERT INTO auth_kv VALUES (?, ?)", ("kirocli:odic:token", json.dumps({
+                "refresh_token": "cli-refresh", "access_token": "cli-access",
+                "region": "us-east-1", "start_url": "https://view.awsapps.com/start"})))
+            connection.execute("INSERT INTO auth_kv VALUES (?, ?)", ("kirocli:odic:device-registration", json.dumps({
+                "client_id": "cli-client", "client_secret": "cli-secret"})))
+        return database
+
+    def test_cli_import_snapshots_auth_only_and_detects_duplicate_credentials(self):
+        database = self.cli_database()
+        with patch.object(stack, "default_credentials", return_value=(database, "sqlite")):
+            self.assertEqual(stack.main(["account", "add", "cli-a"]), 0)
+        account = stack.read_accounts()["accounts"]["cli-a"]
+        self.assertEqual(account["kind"], "json")
+        snapshot = Path(account["credentialsFile"])
+        data = json.loads(snapshot.read_text())
+        self.assertEqual(data["refreshToken"], "cli-refresh")
+        self.assertEqual(data["clientSecret"], "cli-secret")
+        self.assertEqual(data["provider"], "BuilderId")
+        self.assertNotIn("private chat history", snapshot.read_text())
+        with self.assertRaisesRegex(ValueError, "already saved as cli-a"):
+            stack.add_account("duplicate", database, "sqlite")
+        self.assertFalse((stack.state_dir() / "accounts/duplicate").exists())
+        self.creds.write_text(json.dumps({"refreshToken": "cli-refresh"}))
+        with self.assertRaisesRegex(ValueError, "already saved as cli-a"):
+            stack.add_account("json-duplicate", self.creds)
+        with closing(sqlite3.connect(database)) as connection, connection:
+            connection.execute("UPDATE auth_kv SET value=? WHERE key=?", (json.dumps({
+                "refresh_token": "different-login", "profile_arn": "explicit-profile"}), "kirocli:odic:token"))
+        stack.add_account("cli-b", database, "sqlite")
+        self.assertEqual(json.loads(snapshot.read_text())["refreshToken"], "cli-refresh")
+        other = json.loads(Path(stack.read_accounts()["accounts"]["cli-b"]["credentialsFile"]).read_text())
+        self.assertEqual(other["profileArn"], "explicit-profile")
+
+    def test_default_source_prefers_cli_and_logged_out_cli_does_not_fall_back(self):
+        folder = self.root / ("Kiro-Cli" if os.name == "nt" else "kiro-cli")
+        folder.mkdir()
+        database = self.cli_database()
+        destination = folder / "data.sqlite3"
+        database.rename(destination)
+        with patch.dict(os.environ, {"LOCALAPPDATA": str(self.root), "XDG_DATA_HOME": str(self.root)}):
+            self.assertEqual(stack.default_credentials(), (destination, "sqlite"))
+            with closing(sqlite3.connect(destination)) as connection, connection:
+                connection.execute("DELETE FROM auth_kv")
+            with self.assertRaisesRegex(ValueError, "Kiro CLI has no saved login"):
+                stack.main(["account", "add", "logged-out"])
+        self.assertEqual(stack.read_accounts()["accounts"], {})
+
+    def test_cli_import_rejects_incomplete_registration_and_supports_legacy_keys(self):
+        database = self.cli_database()
+        with closing(sqlite3.connect(database)) as connection, connection:
+            connection.execute("UPDATE auth_kv SET key='codewhisperer:odic:token' WHERE key='kirocli:odic:token'")
+            connection.execute("UPDATE auth_kv SET key='codewhisperer:odic:device-registration' WHERE key='kirocli:odic:device-registration'")
+            connection.execute("INSERT INTO state VALUES (?, ?)", ("api.codewhisperer.profile", json.dumps({"arn": "state-profile"})))
+        self.assertEqual(stack.cli_credentials(database)["profileArn"], "state-profile")
+        with closing(sqlite3.connect(database)) as connection, connection:
+            connection.execute("DELETE FROM auth_kv WHERE key='codewhisperer:odic:device-registration'")
+        with self.assertRaisesRegex(ValueError, "device registration is missing"):
+            stack.add_account("incomplete", database, "sqlite")
+        self.assertEqual(stack.read_accounts()["accounts"], {})
 
     def test_atomic_selection_remains_valid_for_readers(self):
         stack.add_account("a", self.creds)

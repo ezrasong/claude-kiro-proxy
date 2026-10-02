@@ -168,6 +168,70 @@ async fn account_swap_preserves_active_stream_and_native_payload_and_count_token
 }
 
 #[tokio::test]
+async fn embedded_system_messages_use_native_field_for_generation_and_token_counting() {
+    let (url, gateway, task) = gateway("system-test", StatusCode::OK).await;
+    let dir = TempDir::new().unwrap();
+    let file = dir.path().join("accounts.json");
+    std::fs::write(
+        &file,
+        json!({"active":"a","accounts":{"a":{"baseUrl":url,"apiKey":"a"}}}).to_string(),
+    )
+    .unwrap();
+    let provider = KiroProvider::with_accounts_file(file);
+    let mut body = request(false);
+    body.messages.insert(
+        1,
+        serde_json::from_value(json!({"role":"system","content":"continued instruction"})).unwrap(),
+    );
+    body.messages.push(serde_json::from_value(json!({"role":"system","content":[{"type":"text","text":"cached instruction","cache_control":{"type":"ephemeral"}}]})).unwrap());
+    let original_messages = request(false).messages;
+    assert_eq!(
+        provider.handle_messages(body.clone(), ctx()).await.status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        provider
+            .handle_count_tokens(body.clone(), ctx())
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    {
+        let captured = gateway.requests.lock().unwrap();
+        for (_, payload) in captured.iter() {
+            assert_eq!(
+                payload["messages"],
+                serde_json::to_value(&original_messages).unwrap()
+            );
+            assert_eq!(
+                payload["system"],
+                json!([
+                    {"type":"text","text":"system prompt"},
+                    {"type":"text","text":"continued instruction"},
+                    {"type":"text","text":"cached instruction","cache_control":{"type":"ephemeral"}}
+                ])
+            );
+        }
+    }
+    body.extra.insert("system".into(), json!("string system"));
+    assert_eq!(
+        provider.handle_messages(body.clone(), ctx()).await.status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        gateway.requests.lock().unwrap()[2].1["system"][0]["text"],
+        "string system"
+    );
+    body.messages[1].content = json!([{"type":"image","source":{}}]);
+    assert_eq!(
+        provider.handle_messages(body, ctx()).await.status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(gateway.requests.lock().unwrap().len(), 3);
+    task.abort();
+}
+
+#[tokio::test]
 async fn manual_selection_never_falls_back_on_quota_and_redacts_error_bodies() {
     let (url_a, _, task_a) = gateway("limited", StatusCode::TOO_MANY_REQUESTS).await;
     let (url_b, b, task_b) = gateway("other", StatusCode::OK).await;

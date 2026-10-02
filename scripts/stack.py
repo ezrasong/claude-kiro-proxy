@@ -162,39 +162,94 @@ def saved_credentials(source):
     return data
 
 
+def cli_credentials(source):
+    """Read a consistent login snapshot, excluding CLI conversations and history."""
+    def entry(connection, table, keys):
+        for key in keys:
+            row = connection.execute(f"SELECT value FROM {table} WHERE key = ?", (key,)).fetchone()
+            if row:
+                value = json.loads(row[0])
+                if not isinstance(value, dict):
+                    raise ValueError("Invalid Kiro CLI credential record")
+                return key, value
+        return None, {}
+
+    with contextlib.closing(sqlite3.connect(source.as_uri() + "?mode=ro", uri=True)) as connection:
+        connection.execute("BEGIN")
+        key, token = entry(connection, "auth_kv", (
+            "kirocli:social:token", "kirocli:odic:token", "codewhisperer:odic:token"))
+        if not isinstance(token.get("refresh_token"), str) or not token["refresh_token"]:
+            raise ValueError("Kiro CLI has no saved login; complete kiro-cli login before adding an account")
+        _, registration = entry(connection, "auth_kv", (
+            "kirocli:odic:device-registration", "codewhisperer:odic:device-registration"))
+        data = {target: token[source_key] for source_key, target in (
+            ("access_token", "accessToken"), ("refresh_token", "refreshToken"),
+            ("expires_at", "expiresAt"), ("profile_arn", "profileArn"),
+            ("region", "region"), ("provider", "provider")) if source_key in token}
+        if key != "kirocli:social:token":
+            for source_key, target in (("client_id", "clientId"), ("client_secret", "clientSecret")):
+                if not registration.get(source_key):
+                    raise ValueError("Kiro CLI device registration is missing; complete kiro-cli login again")
+                data[target] = registration[source_key]
+            data["authMethod"] = "IdC"
+            if not data.get("region") and registration.get("region"):
+                data["region"] = registration["region"]
+        if token.get("start_url") == "https://view.awsapps.com/start":
+            data["provider"] = "BuilderId"
+        try:
+            _, profile = entry(connection, "state", ("api.codewhisperer.profile",))
+        except sqlite3.OperationalError:
+            profile = {}  # Some CLI versions have no profile state table.
+        if not data.get("profileArn") and profile.get("arn"):
+            data["profileArn"] = profile["arn"]
+    return data
+
+
+def default_credentials():
+    if os.name == "nt":
+        cli = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData/Local")) / "Kiro-Cli/data.sqlite3"
+    else:
+        cli = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "kiro-cli/data.sqlite3"
+    # A logged-out CLI store must fail explicitly, rather than import an unrelated
+    # IDE login. IDE users can select their JSON file with --creds.
+    if cli.is_file():
+        return cli, "sqlite"
+    return Path.home() / ".aws/sso/cache/kiro-auth-token.json", "json"
+
+
 def add_account(name, source, kind="json"):
     if not NAME.fullmatch(name):
         raise ValueError("Account names use lowercase letters, digits, _ or - (maximum 40 characters)")
     source = Path(source).expanduser().resolve()
-    data = saved_credentials(source) if kind == "json" else None
-    if kind == "sqlite" and not source.is_file():
-        raise ValueError("Kiro CLI database does not exist")
+    data = cli_credentials(source) if kind == "sqlite" else saved_credentials(source)
     with locked("accounts.lock"):
         registry = read_accounts()
         if name in registry["accounts"]:
             raise ValueError("Account already exists; use a new name to preserve its refreshed credentials")
+        for existing_name, existing in registry["accounts"].items():
+            if existing.get("deleting"):
+                continue
+            path = Path(existing["credentialsFile"])
+            saved = cli_credentials(path) if existing["kind"] == "sqlite" else json.loads(path.read_text(encoding="utf-8-sig"))
+            if saved.get("refreshToken") == data["refreshToken"]:
+                raise ValueError(f"These credentials are already saved as {existing_name}. Complete the other account's login before importing it.")
         folder = private_dir(state_dir() / "accounts" / name)
-        target = folder / ("token.json" if kind == "json" else "data.sqlite3")
-        if kind == "json":
-            atomic_json(target, data)
-        else:
-            with sqlite3.connect(source.as_uri() + "?mode=ro", uri=True) as origin:
-                with sqlite3.connect(target) as destination:
-                    origin.backup(destination)
-            if os.name != "nt":
-                target.chmod(0o600)
+        # Both source formats use gateway-native JSON snapshots. Copy only auth
+        # data from CLI SQLite; its history and conversations stay in the CLI.
+        target = folder / "token.json"
+        atomic_json(target, data)
         ports = {a["port"] for a in registry["accounts"].values()}
         port = next((p for p in range(18770, 65536) if p not in ports), None)
         if port is None:
             raise ValueError("No gateway ports available")
         registry["accounts"][name] = {
             "baseUrl": f"http://127.0.0.1:{port}", "apiKey": secrets.token_urlsafe(32),
-            "port": port, "kind": kind, "credentialsFile": str(target),
+            "port": port, "kind": "json", "credentialsFile": str(target),
         }
         if registry["active"] is None:
             registry["active"] = name
         atomic_json(state_dir() / "kiro-accounts.json", registry)
-    print(f"Saved account {name}. Your Kiro installation's credentials were left in place.")
+    print(f"Saved account {name} from {'Kiro CLI' if kind == 'sqlite' else 'Kiro IDE JSON'}. Source credentials were left in place.")
 
 
 def use_account(name):
@@ -593,7 +648,7 @@ def main(argv=None):
     add = accounts.add_parser("add")
     add.add_argument("name")
     credentials = add.add_mutually_exclusive_group()
-    credentials.add_argument("--creds", default=str(Path.home() / ".aws/sso/cache/kiro-auth-token.json"))
+    credentials.add_argument("--creds", help="Import a Kiro IDE token JSON file")
     credentials.add_argument("--sqlite")
     accounts.add_parser("list")
     use = accounts.add_parser("use")
@@ -616,7 +671,8 @@ def main(argv=None):
     elif args.command == "run":
         return run_claude(args.arguments[1:] if args.arguments[:1] == ["--"] else args.arguments)
     elif args.command == "account" and args.action == "add":
-        add_account(args.name, args.sqlite or args.creds, "sqlite" if args.sqlite else "json")
+        source, kind = (args.sqlite, "sqlite") if args.sqlite else (args.creds, "json") if args.creds else default_credentials()
+        add_account(args.name, source, kind)
     elif args.command == "account" and args.action == "use":
         use_account(args.name)
     elif args.command == "account" and args.action == "delete":
