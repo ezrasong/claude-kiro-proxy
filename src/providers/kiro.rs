@@ -108,7 +108,6 @@ impl KiroProvider {
         let model = resolve_model(body.model.as_deref().unwrap_or_default())?;
         body.model = Some(model.clone());
         normalize_system_messages(&mut body)?;
-        normalize_tool_continuation(&mut body);
         // Read once per request: a manual swap never changes an in-flight stream.
         let account = self.active_account().await?;
         if let Some(monitor) = &ctx.monitor {
@@ -231,34 +230,6 @@ fn normalize_system_messages(body: &mut MessagesRequest) -> Result<(), ProviderE
     body.extra
         .insert("system".into(), serde_json::Value::Array(blocks));
     Ok(())
-}
-
-fn normalize_tool_continuation(body: &mut MessagesRequest) {
-    let Some(message) = body.messages.last_mut() else {
-        return;
-    };
-    if message.role != "user" {
-        return;
-    }
-    let Some(blocks) = message.content.as_array_mut() else {
-        return;
-    };
-    let has_results = blocks.iter().any(|block| block["type"] == "tool_result");
-    let has_text = blocks.iter().any(|block| {
-        block["type"] == "text"
-            && block["text"]
-                .as_str()
-                .is_some_and(|text| !text.trim().is_empty())
-    });
-    if has_results && !has_text {
-        // Claude normally sends tool results without user text. The gateway
-        // substitutes "(empty placeholder)", which can make Opus end the turn
-        // without answering. Preserve every result and give Kiro a continuation.
-        blocks.push(serde_json::json!({
-            "type": "text",
-            "text": "Continue using these tool results."
-        }));
-    }
 }
 
 fn append_system_blocks(

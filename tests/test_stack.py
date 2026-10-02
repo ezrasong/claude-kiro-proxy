@@ -345,6 +345,36 @@ class StackTests(unittest.TestCase):
         self.assertEqual(child.wait(timeout=10), 0)
         self.assertIn("\U0001f47b gateway", log.read_text(encoding="utf-8"))
 
+    def test_gateway_disables_fake_reasoning_and_keeps_account_isolation(self):
+        folder = self.root / "worker"
+        with patch.dict(os.environ, {"FAKE_REASONING": "true", "REFRESH_TOKEN": "other-account", "KIRO_TOKEN": "other", "ACCOUNTS_CONFIG_FILE": "other.json"}):
+            env = stack.gateway_env({"apiKey": "account-key", "port": 18770}, folder)
+        self.assertEqual(env["FAKE_REASONING"], "false")
+        self.assertEqual(env["PROXY_API_KEY"], "account-key")
+        self.assertEqual(env["ACCOUNTS_CONFIG_FILE"], str(folder / "gateway-accounts.json"))
+        self.assertEqual(env["ACCOUNTS_STATE_FILE"], str(folder / "gateway-state.json"))
+        self.assertEqual(env["DEBUG_MODE"], "off")
+        self.assertEqual(env["ACCOUNT_SYSTEM"], "false")
+        self.assertNotIn("REFRESH_TOKEN", env)
+        self.assertNotIn("KIRO_TOKEN", env)
+
+    def test_gateway_patch_is_repeatable_and_preserves_conflicting_edits(self):
+        gateway = self.root / "gateway"
+        gateway.mkdir()
+        subprocess.run(["git", "init", "--quiet"], cwd=gateway, check=True)
+        (gateway / "sample.txt").write_text("original\n")
+        patches = self.root / "patches"
+        patches.mkdir()
+        (patches / "kiro-refusals.patch").write_text("diff --git a/sample.txt b/sample.txt\n--- a/sample.txt\n+++ b/sample.txt\n@@ -1 +1 @@\n-original\n+fixed\n")
+        with patch.object(stack, "ROOT", self.root), patch.object(stack, "GATEWAY", gateway):
+            stack.apply_gateway_patch()
+            stack.apply_gateway_patch()
+            self.assertEqual((gateway / "sample.txt").read_text(), "fixed\n")
+            (gateway / "sample.txt").write_text("user edit\n")
+            with self.assertRaisesRegex(RuntimeError, "resolve local gateway edits"):
+                stack.apply_gateway_patch()
+            self.assertEqual((gateway / "sample.txt").read_text(), "user edit\n")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -332,10 +332,38 @@ def proxy_binary():
     return ROOT / "target" / "release" / ("claude-code-proxy.exe" if os.name == "nt" else "claude-code-proxy")
 
 
+def apply_gateway_patch():
+    """Apply our pinned refusal fix once, preserving unrelated gateway changes."""
+    with locked("gateway-patch.lock"):
+        patch_file = ROOT / "patches" / "kiro-refusals.patch"
+        command = ["git", "apply", "--whitespace=nowarn"]
+        if subprocess.run([*command, "--reverse", "--check", str(patch_file)], cwd=GATEWAY,
+                          capture_output=True).returncode == 0:
+            return
+        if subprocess.run([*command, "--check", str(patch_file)], cwd=GATEWAY,
+                          capture_output=True).returncode != 0:
+            raise RuntimeError("Kiro gateway source does not match its pinned refusal patch; resolve local gateway edits before starting.")
+        subprocess.run([*command, str(patch_file)], cwd=GATEWAY, check=True)
+
+
+def gateway_env(account, folder):
+    """Isolate authentication and disable synthetic reasoning prompt injection."""
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith(("KIRO_", "ACCOUNTS_")) and k not in
+           ("REFRESH_TOKEN", "PROFILE_ARN", "PROXY_API_KEY", "ACCOUNT_SYSTEM", "DEBUG_MODE")}
+    env.update({"PROXY_API_KEY": account["apiKey"], "SERVER_HOST": "127.0.0.1",
+                "SERVER_PORT": str(account["port"]), "ACCOUNT_SYSTEM": "false", "DEBUG_MODE": "off",
+                "FAKE_REASONING": "false",
+                "ACCOUNTS_CONFIG_FILE": str(folder / "gateway-accounts.json"),
+                "ACCOUNTS_STATE_FILE": str(folder / "gateway-state.json")})
+    return env
+
+
 def setup():
     if sys.version_info < (3, 12):
         raise RuntimeError("Setup requires Python 3.12 or newer")
     subprocess.run(["git", "submodule", "update", "--init", "--recursive"], cwd=ROOT, check=True)
+    apply_gateway_patch()
     if not gateway_python().is_file():
         subprocess.run([sys.executable, "-m", "venv", str(ROOT / ".venv")], check=True)
     subprocess.run([str(gateway_python()), "-m", "pip", "install", "-r", str(ROOT / "scripts/requirements-kiro.lock")], check=True)
@@ -439,6 +467,7 @@ def serve():
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
     with locked("service.lock", wait=False):
+        apply_gateway_patch()
         directory = state_dir()
         marker = directory / "service.json"
         marker.unlink(missing_ok=True)
@@ -465,13 +494,7 @@ def serve():
                         available(account["port"])
                         atomic_json(folder / "gateway-accounts.json", gateway_credentials(account))
                         # Never inherit another account, auto-failover, or debug capture.
-                        worker_env = {k: v for k, v in os.environ.items()
-                                      if not k.startswith(("KIRO_", "ACCOUNTS_")) and k not in
-                                      ("REFRESH_TOKEN", "PROFILE_ARN", "PROXY_API_KEY", "ACCOUNT_SYSTEM", "DEBUG_MODE")}
-                        worker_env.update({"PROXY_API_KEY": account["apiKey"], "SERVER_HOST": "127.0.0.1",
-                                           "SERVER_PORT": str(account["port"]), "ACCOUNT_SYSTEM": "false", "DEBUG_MODE": "off",
-                                           "ACCOUNTS_CONFIG_FILE": str(folder / "gateway-accounts.json"),
-                                           "ACCOUNTS_STATE_FILE": str(folder / "gateway-state.json")})
+                        worker_env = gateway_env(account, folder)
                         worker = start_child([str(gateway_python()), str(GATEWAY / "main.py"),
                                               "--host", "127.0.0.1", "--port", str(account["port"])], worker_env, folder / "gateway.log")
                         children.append(worker)

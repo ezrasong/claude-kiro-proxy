@@ -54,8 +54,10 @@ Clone with `git clone --recurse-submodules` before running setup.
 macOS/Linux: use `python3` and `source scripts/activate.sh` in Bash.
 
 This repo retains the upstream Claude proxy's code and history (MIT).
-Kiro Gateway is a pinned, unmodified submodule and separate HTTP service
-(AGPL-3.0). Both projects' source and license notices are preserved.
+Kiro Gateway is a pinned submodule and separate HTTP service (AGPL-3.0), with a
+tracked patch that reports service refusals instead of empty responses. Setup
+applies the patch automatically. Its synthetic reasoning injection is disabled.
+Both projects' source and license notices are preserved.
 See [the upstream README](docs/UPSTREAM-README.md) for the original providers.
 
 Integration tests use local mock gateways; a live paid-account request is a

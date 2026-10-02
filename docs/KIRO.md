@@ -200,12 +200,17 @@ frames, keeping the Claude Code connection active through Caveman. Upstream
 timeouts and stream validation still apply; keepalives do not retry requests or
 switch accounts.
 
-Claude Code normally follows a tool call with a user message containing only
-tool results. Kiro Gateway substitutes `(empty placeholder)` for that message's
-text, which can make Opus finish without replying. The Kiro adapter adds
-`Continue using these tool results.` only to the final user message when it
-contains tool results and no nonblank text. Tool data and existing instructions
-are preserved. Streaming, non-streaming and token counting use the same rule.
+The gateway's synthetic reasoning feature is disabled (`FAKE_REASONING=false`).
+It adds instructions asking for exposed thinking, which can cause Kiro to refuse
+ordinary Claude Code conversations with `CONTENT_FILTERED / REASONING_EXTRACTION`.
+Effort settings do not provide native extended-thinking support through this gateway.
+The proxy preserves tool results and user text without adding continuation prompts.
+
+Setup and service startup apply `patches/kiro-refusals.patch` to the pinned gateway.
+This patch surfaces Kiro refusal metadata as a visible explanation and a `refusal`
+stop reason (OpenAI: `content_filter`), instead of an empty success. Refusals are
+not retried or routed to another account. The service's suggested options are to
+select another model, start a new conversation, or rewind to an earlier point.
 
 Listeners bind to loopback. The main proxy retains upstream's local-client trust
 model; other programs on your machine can call it. The Kiro adapter only accepts
@@ -255,7 +260,9 @@ python tests/smoke_caveman.py --caveman-bin "$HOME/.caveman/bin/caveman-proxy.ex
 ```
 
 Upstream source and history are retained. Claude Code Proxy is MIT licensed;
-the unmodified Kiro Gateway submodule is separately AGPL-3.0 licensed. This repo
+the Kiro Gateway submodule and its downstream patch are separately AGPL-3.0 licensed. This repo
 uses it as a separate HTTP service and preserves its source and license. Its
-commit and gateway dependencies are pinned. Run integration tests before changing
-either pin.
+commit and gateway dependencies are pinned; the tracked refusal patch is applied
+idempotently and leaves the submodule working tree modified. Conflicting gateway
+edits stop startup instead of being overwritten. Run integration tests before
+changing either pin or the patch.

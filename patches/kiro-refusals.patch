@@ -1,0 +1,475 @@
+diff --git a/kiro/parsers.py b/kiro/parsers.py
+index 9bd7f43..f680c42 100644
+--- a/kiro/parsers.py
++++ b/kiro/parsers.py
+@@ -246,6 +246,8 @@ class AwsEventStreamParser:
+         ('{"followupPrompt":', 'followup'),
+         ('{"usage":', 'usage'),
+         ('{"contextUsagePercentage":', 'context_usage'),
++        ('{"stopDetails":', 'metadata'),
++        ('{"stopReason":', 'metadata'),
+     ]
+     
+     def __init__(self):
+@@ -328,6 +330,21 @@ class AwsEventStreamParser:
+             return {"type": "usage", "data": data.get('usage', 0)}
+         elif event_type == 'context_usage':
+             return {"type": "context_usage", "data": data.get('contextUsagePercentage', 0)}
++        elif event_type == 'metadata' and data.get('stopReason') == 'CONTENT_FILTERED':
++            details = data.get('stopDetails')
++            refusal = details.get('refusal') if isinstance(details, dict) else None
++            category = refusal.get('category') if isinstance(refusal, dict) else None
++            if not isinstance(category, str) or not re.fullmatch(r'[A-Z][A-Z0-9_]{0,79}', category):
++                category = 'CONTENT_FILTERED'
++            logger.warning(f"Kiro refused the conversation: {category}")
++            return {
++                "type": "refusal",
++                "data": (
++                    f"\n\nKiro refused to continue this conversation ({category}). "
++                    "Select a different model, start a new conversation, or rewind "
++                    "to an earlier point and try a different approach."
++                ),
++            }
+         
+         return None
+     
+@@ -566,4 +583,4 @@ class AwsEventStreamParser:
+         self.buffer = ""
+         self.last_content = None
+         self.current_tool_call = None
+-        self.tool_calls = []
+\ No newline at end of file
++        self.tool_calls = []
+diff --git a/kiro/streaming_anthropic.py b/kiro/streaming_anthropic.py
+index 4fee71e..9dedf09 100644
+--- a/kiro/streaming_anthropic.py
++++ b/kiro/streaming_anthropic.py
+@@ -220,8 +220,10 @@ async def stream_kiro_to_anthropic(
+             }
+         })
+         
++        refused = False
+         async for event in parse_kiro_stream(response, first_token_timeout):
+-            if event.type == "content":
++            if event.type in ("content", "refusal"):
++                refused = refused or event.type == "refusal"
+                 content = event.content or ""
+                 full_content += content
+                 
+@@ -527,7 +529,7 @@ async def stream_kiro_to_anthropic(
+         stream_completed_normally = context_usage_percentage is not None
+         
+         # Check for bracket-style tool calls in full content
+-        bracket_tool_calls = parse_bracket_tool_calls(full_content)
++        bracket_tool_calls = [] if refused else parse_bracket_tool_calls(full_content)
+         if bracket_tool_calls:
+             # Close thinking block if open
+             if thinking_block_started and thinking_block_index is not None:
+@@ -608,7 +610,7 @@ async def stream_kiro_to_anthropic(
+         
+         # Detect content truncation (missing completion signals)
+         content_was_truncated = (
+-            not stream_completed_normally and
++            not refused and not stream_completed_normally and
+             len(full_content) > 0 and
+             not tool_blocks  # Don't confuse with tool call truncation
+         )
+@@ -635,7 +637,9 @@ async def stream_kiro_to_anthropic(
+                 input_tokens = prompt_tokens
+         
+         # Determine stop reason (truncation has highest priority)
+-        if content_was_truncated:
++        if refused:
++            stop_reason = "refusal"
++        elif content_was_truncated:
+             stop_reason = "max_tokens"
+         elif tool_blocks:
+             stop_reason = "tool_use"
+@@ -818,7 +822,7 @@ async def collect_anthropic_response(
+     # Detect content truncation (missing completion signals)
+     stream_completed_normally = result.context_usage_percentage is not None
+     content_was_truncated = (
+-        not stream_completed_normally and
++        not result.refused and not stream_completed_normally and
+         len(result.content) > 0 and
+         not result.tool_calls  # Don't confuse with tool call truncation
+     )
+@@ -832,7 +836,9 @@ async def collect_anthropic_response(
+         )
+     
+     # Determine stop reason (truncation has highest priority)
+-    if content_was_truncated:
++    if result.refused:
++        stop_reason = "refusal"
++    elif content_was_truncated:
+         stop_reason = "max_tokens"
+     elif result.tool_calls:
+         stop_reason = "tool_use"
+diff --git a/kiro/streaming_core.py b/kiro/streaming_core.py
+index 4294ffa..33d5603 100644
+--- a/kiro/streaming_core.py
++++ b/kiro/streaming_core.py
+@@ -68,8 +68,8 @@ class KiroEvent:
+     This format is API-agnostic and can be converted to both OpenAI and Anthropic formats.
+     
+     Attributes:
+-        type: Event type (content, thinking, tool_use, usage, context_usage, error)
+-        content: Text content (for content events)
++        type: Event type (content, thinking, tool_use, usage, context_usage, refusal, error)
++        content: Text content (for content events) or a safe refusal notice
+         thinking_content: Thinking/reasoning content (for thinking events)
+         tool_use: Tool use data (for tool_use events)
+         usage: Usage/metering data (for usage events)
+@@ -98,12 +98,14 @@ class StreamResult:
+         tool_calls: List of tool calls
+         usage: Usage information
+         context_usage_percentage: Context usage percentage from Kiro API
++        refused: Whether Kiro explicitly filtered this response
+     """
+     content: str = ""
+     thinking_content: str = ""
+     tool_calls: List[Dict[str, Any]] = field(default_factory=list)
+     usage: Optional[Dict[str, Any]] = None
+     context_usage_percentage: Optional[float] = None
++    refused: bool = False
+ 
+ 
+ class FirstTokenTimeoutError(Exception):
+@@ -174,6 +176,8 @@ async def parse_kiro_stream(
+             if event.type == "content" or event.type == "thinking":
+                 first_token_received = True
+             yield event
++            if event.type == "refusal":
++                return
+         
+         # Continue reading remaining chunks
+         async for chunk in byte_iterator:
+@@ -182,6 +186,8 @@ async def parse_kiro_stream(
+             
+             async for event in _process_chunk(parser, chunk, thinking_parser):
+                 yield event
++                if event.type == "refusal":
++                    return
+         
+         # Finalize thinking parser and yield any remaining content
+         if thinking_parser:
+@@ -246,7 +252,10 @@ async def _process_chunk(
+     events = parser.feed(chunk)
+     
+     for event in events:
+-        if event["type"] == "content":
++        if event["type"] == "refusal":
++            yield KiroEvent(type="refusal", content=event["data"])
++            return
++        elif event["type"] == "content":
+             content = event["data"]
+             
+             # Process through thinking parser if enabled
+@@ -309,7 +318,12 @@ async def collect_stream_to_result(
+     full_content_for_bracket_tools = ""
+     
+     async for event in parse_kiro_stream(response, first_token_timeout, enable_thinking_parser):
+-        if event.type == "content" and event.content:
++        if event.type == "refusal":
++            result.content += event.content or ""
++            result.refused = True
++            result.tool_calls.clear()
++            return result
++        elif event.type == "content" and event.content:
+             result.content += event.content
+             full_content_for_bracket_tools += event.content
+         elif event.type == "thinking" and event.thinking_content:
+@@ -502,4 +516,4 @@ async def stream_with_first_token_retry(
+         raise Exception(
+             f"Model did not respond within {first_token_timeout}s after {max_retries} attempts. "
+             "Please try again."
+-        )
+\ No newline at end of file
++        )
+diff --git a/kiro/streaming_openai.py b/kiro/streaming_openai.py
+index b617954..c0b8ee8 100644
+--- a/kiro/streaming_openai.py
++++ b/kiro/streaming_openai.py
+@@ -124,13 +124,15 @@ async def stream_kiro_to_openai_internal(
+     full_thinking_content = ""  # Accumulated thinking content for non-streaming
+     
+     streaming_error_occurred = False
++    refused = False
+     tool_calls_from_stream = []
+     
+     try:
+         # Use streaming_core.parse_kiro_stream for unified event parsing
+         # This handles AWS SSE parsing, first token timeout, and thinking parser
+         async for event in parse_kiro_stream(response, first_token_timeout):
+-            if event.type == "content" and event.content:
++            if event.type in ("content", "refusal") and event.content:
++                refused = refused or event.type == "refusal"
+                 # Accumulate content for bracket tool call detection
+                 full_content += event.content
+                 
+@@ -274,13 +276,13 @@ async def stream_kiro_to_openai_internal(
+         stream_completed_normally = received_usage or received_context_usage
+         
+         # Check bracket-style tool calls in full content
+-        bracket_tool_calls = parse_bracket_tool_calls(full_content)
++        bracket_tool_calls = [] if refused else parse_bracket_tool_calls(full_content)
+         all_tool_calls = tool_calls_from_stream + bracket_tool_calls
+         all_tool_calls = deduplicate_tool_calls(all_tool_calls)
+         
+         # Detect content truncation (missing completion signals)
+         content_was_truncated = (
+-            not stream_completed_normally and
++            not refused and not stream_completed_normally and
+             len(full_content) > 0 and
+             not all_tool_calls  # Don't confuse with tool call truncation
+         )
+@@ -294,7 +296,9 @@ async def stream_kiro_to_openai_internal(
+             )
+         
+         # Determine finish_reason (truncation has highest priority)
+-        if content_was_truncated:
++        if refused:
++            finish_reason = "content_filter"
++        elif content_was_truncated:
+             finish_reason = "length"
+         elif all_tool_calls:
+             finish_reason = "tool_calls"
+@@ -685,4 +689,4 @@ async def collect_stream_response(
+             "finish_reason": finish_reason
+         }],
+         "usage": usage
+-    }
+\ No newline at end of file
++    }
+diff --git a/tests/conftest.py b/tests/conftest.py
+index 69ba58a..c9a9f66 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -11,6 +11,8 @@ import asyncio
+ import json
+ import pytest
+ import time
++import struct
++import zlib
+ from typing import AsyncGenerator, Dict, Any, List
+ from unittest.mock import AsyncMock, MagicMock, Mock, patch
+ from datetime import datetime, timezone
+@@ -220,6 +222,34 @@ def mock_kiro_models_response():
+ # Kiro Streaming Response Fixtures
+ # =============================================================================
+ 
++@pytest.fixture
++def refused_kiro_response() -> httpx.Response:
++    """Build fragmented AWS frames with a pending tool and a terminal refusal."""
++    def frame(event: str, value: Dict[str, Any]) -> bytes:
++        """Encode an AWS event frame, including header and message CRCs."""
++        key = b':event-type'
++        name = event.encode()
++        headers = bytes([len(key)]) + key + b'\x07' + len(name).to_bytes(2, 'big') + name
++        payload = json.dumps(value, separators=(',', ':')).encode()
++        prelude = struct.pack('>II', 16 + len(headers) + len(payload), len(headers))
++        message = prelude + struct.pack('>I', zlib.crc32(prelude)) + headers + payload
++        return message + struct.pack('>I', zlib.crc32(message))
++
++    raw = frame('toolUseEvent', {'name': 'never_run', 'toolUseId': 'pending', 'input': '{}', 'stop': True})
++    raw += frame('metadataEvent', {
++        'stopDetails': {'refusal': {'category': 'REASONING_EXTRACTION', 'explanation': 'do-not-forward-private-detail'}},
++        'stopReason': 'CONTENT_FILTERED',
++    })
++    raw += frame('assistantResponseEvent', {'content': 'DO_NOT_SHOW_AFTER_REFUSAL'})
++
++    class Stream(httpx.AsyncByteStream):
++        """Deliver frames across arbitrary byte boundaries without a network."""
++        async def __aiter__(self) -> AsyncGenerator[bytes, None]:
++            for offset in range(0, len(raw), 7):
++                yield raw[offset:offset + 7]
++
++    return httpx.Response(200, stream=Stream())
++
+ @pytest.fixture
+ def mock_kiro_streaming_chunks():
+     """
+diff --git a/tests/unit/test_parsers.py b/tests/unit/test_parsers.py
+index 4e981aa..bbe32f0 100644
+--- a/tests/unit/test_parsers.py
++++ b/tests/unit/test_parsers.py
+@@ -6,6 +6,7 @@ Tests the parsing logic for AWS SSE stream from Kiro API.
+ """
+ 
+ import pytest
++import json
+ 
+ from kiro.parsers import (
+     AwsEventStreamParser,
+@@ -15,6 +16,35 @@ from kiro.parsers import (
+ )
+ 
+ 
++@pytest.mark.parametrize('reason_first', [False, True])
++def test_metadata_refusal_key_order_and_split_frames(reason_first: bool) -> None:
++    """Refusal metadata must survive key reordering and arbitrary chunk splits."""
++    pairs = [('stopDetails', {'refusal': {'category': 'REASONING_EXTRACTION'}}), ('stopReason', 'CONTENT_FILTERED')]
++    value = dict(reversed(pairs) if reason_first else pairs)
++    raw = json.dumps(value, separators=(',', ':')).encode()
++    parser = AwsEventStreamParser()
++    events = []
++    for offset in range(0, len(raw), 3):
++        events.extend(parser.feed(raw[offset:offset + 3]))
++    assert len(events) == 1
++    assert events[0]['type'] == 'refusal'
++    assert 'REASONING_EXTRACTION' in events[0]['data']
++
++
++@pytest.mark.parametrize('details', [None, 'invalid', {}, {'refusal': 'invalid'}, {'refusal': {'category': 'secret\nvalue'}}])
++def test_filtered_metadata_uses_safe_fallback(details: object) -> None:
++    """Missing or malformed details cannot hide a refusal or inject diagnostics."""
++    events = AwsEventStreamParser().feed(json.dumps({'stopReason': 'CONTENT_FILTERED', 'stopDetails': details}).encode())
++    assert events[0]['type'] == 'refusal'
++    assert '(CONTENT_FILTERED)' in events[0]['data']
++    assert 'secret' not in events[0]['data']
++
++
++def test_normal_stop_metadata_is_not_a_refusal() -> None:
++    """Ordinary terminal metadata must not add synthetic response content."""
++    assert AwsEventStreamParser().feed(b'{"stopReason":"END_TURN"}') == []
++
++
+ class TestFindMatchingBrace:
+     """Tests for find_matching_brace function."""
+     
+@@ -1356,4 +1386,4 @@ class TestTruncationRecoveryIntegration:
+         assert "_truncation_info" in aws_event_parser.tool_calls[1]
+         
+         print("Checking: Third tool call NOT marked as truncated...")
+-        assert aws_event_parser.tool_calls[2].get("_truncation_detected") is not True
+\ No newline at end of file
++        assert aws_event_parser.tool_calls[2].get("_truncation_detected") is not True
+diff --git a/tests/unit/test_streaming_anthropic.py b/tests/unit/test_streaming_anthropic.py
+index c27d599..550d1ac 100644
+--- a/tests/unit/test_streaming_anthropic.py
++++ b/tests/unit/test_streaming_anthropic.py
+@@ -13,6 +13,7 @@ Tests for:
+ 
+ import pytest
+ import json
++import httpx
+ import uuid
+ from unittest.mock import AsyncMock, MagicMock, patch
+ 
+@@ -27,6 +28,26 @@ from kiro.streaming_anthropic import (
+ from kiro.streaming_core import KiroEvent, StreamResult
+ 
+ 
++@pytest.mark.asyncio
++@pytest.mark.parametrize('stream', [True, False])
++async def test_metadata_refusal_visible_in_both_modes(stream: bool, refused_kiro_response: httpx.Response, mock_model_cache: MagicMock, mock_auth_manager: MagicMock) -> None:
++    """Anthropic responses preserve refusal semantics and show the service reason."""
++    if stream:
++        chunks = [chunk async for chunk in stream_kiro_to_anthropic(refused_kiro_response, 'claude-opus-5-5', mock_model_cache, mock_auth_manager)]
++        raw = ''.join(chunks)
++        events = [json.loads(line[6:]) for line in raw.splitlines() if line.startswith('data: ')]
++        assert events[-1]['type'] == 'message_stop'
++        assert next(event for event in events if event['type'] == 'message_delta')['delta']['stop_reason'] == 'refusal'
++    else:
++        result = await collect_anthropic_response(refused_kiro_response, 'claude-opus-5-5', mock_model_cache, mock_auth_manager)
++        assert result['stop_reason'] == 'refusal'
++        raw = json.dumps(result)
++    assert 'REASONING_EXTRACTION' in raw
++    assert 'never_run' not in raw
++    assert 'DO_NOT_SHOW' not in raw
++    assert 'do-not-forward' not in raw
++
++
+ # ==================================================================================================
+ # Fixtures
+ # ==================================================================================================
+diff --git a/tests/unit/test_streaming_core.py b/tests/unit/test_streaming_core.py
+index 4813b4e..4f20116 100644
+--- a/tests/unit/test_streaming_core.py
++++ b/tests/unit/test_streaming_core.py
+@@ -15,6 +15,7 @@ Tests for:
+ 
+ import pytest
+ import asyncio
++import httpx
+ from unittest.mock import AsyncMock, MagicMock, patch
+ from dataclasses import asdict
+ 
+@@ -30,6 +31,25 @@ from kiro.streaming_core import (
+ )
+ 
+ 
++@pytest.mark.asyncio
++async def test_metadata_refusal_stops_content_and_pending_tools(refused_kiro_response: httpx.Response) -> None:
++    """A filtered terminal event must stop parsing before late content or tools."""
++    events = [event async for event in parse_kiro_stream(refused_kiro_response)]
++    assert [event.type for event in events] == ['refusal']
++    assert 'REASONING_EXTRACTION' in events[0].content
++    assert 'DO_NOT_SHOW' not in events[0].content
++    assert 'do-not-forward' not in events[0].content
++
++
++@pytest.mark.asyncio
++async def test_collected_refusal_is_explicit_and_has_no_tools(refused_kiro_response: httpx.Response) -> None:
++    """Buffered consumers receive a visible refusal and cannot execute pending tools."""
++    result = await collect_stream_to_result(refused_kiro_response)
++    assert result.refused
++    assert 'REASONING_EXTRACTION' in result.content
++    assert not result.tool_calls
++
++
+ # ==================================================================================================
+ # Fixtures
+ # ==================================================================================================
+@@ -1831,4 +1851,4 @@ class TestStreamWithFirstTokenRetryCore:
+         # make_request should be called immediately (old behavior)
+         assert make_request_call_count == 1
+         assert len(chunks) == 1
+-        print("✓ make_request called immediately when initial_response is None")
+\ No newline at end of file
++        print("✓ make_request called immediately when initial_response is None")
+diff --git a/tests/unit/test_streaming_openai.py b/tests/unit/test_streaming_openai.py
+index b52c1b6..19123f1 100644
+--- a/tests/unit/test_streaming_openai.py
++++ b/tests/unit/test_streaming_openai.py
+@@ -13,6 +13,7 @@ Tests for:
+ 
+ import pytest
+ import json
++import httpx
+ import asyncio
+ from unittest.mock import AsyncMock, MagicMock, patch
+ 
+@@ -26,6 +27,25 @@ from kiro.streaming_openai import (
+ from kiro.streaming_core import KiroEvent
+ 
+ 
++@pytest.mark.asyncio
++@pytest.mark.parametrize('stream', [True, False])
++async def test_metadata_refusal_visible_in_both_modes(stream: bool, refused_kiro_response: httpx.Response, mock_http_client: AsyncMock, mock_model_cache: MagicMock, mock_auth_manager: MagicMock) -> None:
++    """OpenAI responses expose content_filter with a visible, safe explanation."""
++    if stream:
++        chunks = [chunk async for chunk in stream_kiro_to_openai(mock_http_client, refused_kiro_response, 'claude-opus-5-5', mock_model_cache, mock_auth_manager)]
++        raw = ''.join(chunks)
++        events = [json.loads(line[6:]) for line in raw.splitlines() if line.startswith('data: ') and line != 'data: [DONE]']
++        assert events[-1]['choices'][0]['finish_reason'] == 'content_filter'
++    else:
++        result = await collect_stream_response(mock_http_client, refused_kiro_response, 'claude-opus-5-5', mock_model_cache, mock_auth_manager)
++        assert result['choices'][0]['finish_reason'] == 'content_filter'
++        raw = json.dumps(result)
++    assert 'REASONING_EXTRACTION' in raw
++    assert 'never_run' not in raw
++    assert 'DO_NOT_SHOW' not in raw
++    assert 'do-not-forward' not in raw
++
++
+ # ==================================================================================================
+ # Fixtures
+ # ==================================================================================================
+@@ -1484,4 +1504,4 @@ class TestStreamingOpenaiTruncationDetection:
+         
+         # Should extract "length" from streaming chunks
+         assert result["choices"][0]["finish_reason"] == "length"
+-        print("✓ collect_stream_response extracts finish_reason correctly")
+\ No newline at end of file
++        print("✓ collect_stream_response extracts finish_reason correctly")

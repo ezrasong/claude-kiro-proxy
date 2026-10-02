@@ -232,7 +232,7 @@ async fn embedded_system_messages_use_native_field_for_generation_and_token_coun
 }
 
 #[tokio::test]
-async fn tool_result_only_followups_continue_in_streaming_buffered_and_count_requests() {
+async fn tool_results_are_preserved_in_streaming_buffered_and_count_requests() {
     let (url, gateway, task) = gateway("continued-answer", StatusCode::OK).await;
     let dir = TempDir::new().unwrap();
     let file = dir.path().join("accounts.json");
@@ -274,17 +274,13 @@ async fn tool_result_only_followups_continue_in_streaming_buffered_and_count_req
         assert_eq!(payload["messages"][0], history[0]);
         assert_eq!(payload["messages"][1], history[1]);
         let blocks = payload["messages"][2]["content"].as_array().unwrap();
-        assert_eq!(&blocks[..2], history[2]["content"].as_array().unwrap());
-        assert_eq!(
-            blocks[2],
-            json!({"type":"text","text":"Continue using these tool results."})
-        );
+        assert_eq!(blocks, history[2]["content"].as_array().unwrap());
     }
     task.abort();
 }
 
 #[tokio::test]
-async fn tool_continuation_preserves_explicit_text_and_other_messages() {
+async fn explicit_user_text_and_other_messages_are_preserved() {
     let (url, gateway, task) = gateway("unchanged", StatusCode::OK).await;
     let dir = TempDir::new().unwrap();
     let file = dir.path().join("accounts.json");
