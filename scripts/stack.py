@@ -343,6 +343,7 @@ def serve():
                     print(f"Starting Kiro account {name}; log: {folder / 'gateway.log'}", flush=True)
                 if not marker.exists():
                     atomic_json(marker, {"ready": True, "pid": os.getpid()})
+                    open_monitor()
                 time.sleep(0.5)
         finally:
             marker.unlink(missing_ok=True)
@@ -401,6 +402,30 @@ def requested_model(arguments):
     return os.environ.get("ANTHROPIC_MODEL", "kiro:claude-sonnet-4-5")
 
 
+def monitor():
+    """Attach the upstream dashboard; its lifetime is separate from the service."""
+    with locked("monitor.lock", wait=False):
+        ensure_running()
+        return subprocess.call([str(proxy_binary()), "monitor", "--url", f"http://127.0.0.1:{PROXY_PORT}"])
+
+
+def open_monitor():
+    """Interactive Windows sessions show the original dashboard in its own console."""
+    if sys.platform != "win32" or not sys.stdin.isatty() or not sys.stdout.isatty():
+        return
+    try:
+        with locked("monitor.lock", wait=False):
+            pass
+    except RuntimeError:
+        return
+    env = {**os.environ, "CCP_KIRO_HOME": str(state_dir())}
+    try:
+        subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "monitor"],
+                         env=env, cwd=ROOT, creationflags=subprocess.CREATE_NEW_CONSOLE)
+    except OSError as error:
+        print(f"Could not open the dashboard: {error}. Run scripts/stack.py monitor in another terminal.", file=sys.stderr)
+
+
 def run_claude(arguments):
     registry = read_accounts()
     model = requested_model(arguments)
@@ -431,6 +456,7 @@ def run_claude(arguments):
         command = [shutil.which("node") or "node", str(script), "claude", *arguments]
     else:
         command = [executable, "claude", *arguments]
+    open_monitor()
     return subprocess.call(command, env=launch_env())
 
 
@@ -439,6 +465,7 @@ def main(argv=None):
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("setup", help="Install isolated gateway dependencies and build the main proxy")
     commands.add_parser("serve", help="Run the main proxy and one gateway per saved account")
+    commands.add_parser("monitor", help="Open the original Claude proxy dashboard without stopping its services on exit")
     commands.add_parser("stop", help="Stop this stack's supervised processes")
     commands.add_parser("status", help="Show local service and account status without credentials")
     run = commands.add_parser("run", help="Auto-start the stack and forward arguments to caveman claude")
@@ -457,6 +484,8 @@ def main(argv=None):
         setup()
     elif args.command == "serve":
         serve()
+    elif args.command == "monitor":
+        return monitor()
     elif args.command == "stop":
         if service_owned():
             (state_dir() / "stop").touch()

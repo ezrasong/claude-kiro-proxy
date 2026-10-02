@@ -16,6 +16,9 @@ caveman claude --model gpt-6-sol
 
 Both backends stay available. Claude arguments pass through unchanged.
 The launcher automatically starts the services when needed.
+On Windows, interactive launches also open the original Claude proxy dashboard
+in a separate terminal. Closing the dashboard leaves the services running.
+Open it manually with `python scripts/stack.py monitor`.
 
 ```powershell
 # Sign in to another paid account through Kiro, then:

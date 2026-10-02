@@ -42,6 +42,11 @@ Caveman and preserves its compression controls.
 
 The launcher starts the main proxy and gateway workers in the background when
 needed. It does not alter global Claude settings or Caveman's installed package.
+Interactive Windows launches open the original Claude proxy terminal dashboard
+in a separate console. The dashboard can stay open across Claude sessions;
+closing it leaves the background proxies running. Noninteractive runs do not
+open a window. On other platforms, open the dashboard in another terminal with
+`python3 scripts/stack.py monitor`.
 Add `. 'C:/full/path/to/claude-kiro-proxy/scripts/activate.ps1'` to your PowerShell
 `$PROFILE` to activate in every new terminal. Otherwise dot-source it once per
 terminal. Only `caveman claude` enters this stack; other Caveman commands use
@@ -135,7 +140,7 @@ without exposing gateway error bodies or credentials.
 python scripts/stack.py status
 python scripts/stack.py serve   # foreground; Ctrl+C stops owned processes
 python scripts/stack.py stop    # stop the supervised main proxy and gateways
-./target/release/claude-code-proxy.exe monitor
+python scripts/stack.py monitor # original dashboard; starts the stack if needed
 ```
 
 State lives in `~/.claude-kiro-proxy`, outside the checkout. Set `CCP_KIRO_HOME`

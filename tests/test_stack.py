@@ -96,6 +96,34 @@ class StackTests(unittest.TestCase):
                     stack.run_claude([])
                 start.assert_not_called()
 
+    def test_monitor_attaches_to_service_and_releases_its_lock_on_exit(self):
+        with patch.object(stack, "ensure_running") as start, patch.object(stack.subprocess, "call", return_value=0) as call:
+            self.assertEqual(stack.main(["monitor"]), 0)
+        start.assert_called_once()
+        self.assertEqual(call.call_args.args[0][1:], ["monitor", "--url", "http://127.0.0.1:18765"])
+        with stack.locked("monitor.lock", wait=False):
+            pass
+
+    def test_interactive_windows_launch_opens_dashboard_in_separate_console(self):
+        stack.state_dir()
+        with patch.object(stack.sys, "platform", "win32"), patch.object(stack.sys.stdin, "isatty", return_value=True), patch.object(stack.sys.stdout, "isatty", return_value=True), patch.object(stack.subprocess, "CREATE_NEW_CONSOLE", 16, create=True), patch.object(stack.subprocess, "Popen") as spawn:
+            stack.open_monitor()
+        command = spawn.call_args.args[0]
+        self.assertEqual(command[0], sys.executable)
+        self.assertEqual(command[-1], "monitor")
+        self.assertEqual(spawn.call_args.kwargs["creationflags"], 16)
+        self.assertEqual(spawn.call_args.kwargs["env"]["CCP_KIRO_HOME"], str(stack.state_dir()))
+
+    def test_existing_dashboard_and_piped_sessions_do_not_open_another_window(self):
+        stack.state_dir()
+        with patch.object(stack.sys, "platform", "win32"), patch.object(stack.sys.stdin, "isatty", return_value=True), patch.object(stack.sys.stdout, "isatty", return_value=True), patch.object(stack.subprocess, "Popen") as spawn:
+            with stack.locked("monitor.lock", wait=False):
+                stack.open_monitor()
+            spawn.assert_not_called()
+        with patch.object(stack.sys, "platform", "win32"), patch.object(stack.sys.stdin, "isatty", return_value=False), patch.object(stack.subprocess, "Popen") as spawn:
+            stack.open_monitor()
+            spawn.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
