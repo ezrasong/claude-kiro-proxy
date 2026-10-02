@@ -225,7 +225,8 @@ def setup():
 
 def http_json(url, key=None):
     # Local workers never use an HTTP_PROXY supplied by the environment.
-    request = urllib.request.Request(url, headers={"x-api-key": key} if key else {})
+    # The gateway's OpenAI-compatible model catalog requires Bearer auth.
+    request = urllib.request.Request(url, headers={"Authorization": f"Bearer {key}"} if key else {})
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     with opener.open(request, timeout=2) as response:
         return json.load(response)
@@ -292,6 +293,17 @@ def wait_child(child, url, key=None):
     raise RuntimeError("Proxy startup timed out; inspect the private state directory's logs")
 
 
+def gateway_credentials(account):
+    entry = {"type": account["kind"], "path": account["credentialsFile"]}
+    if account["kind"] == "json":
+        credentials = json.loads(Path(account["credentialsFile"]).read_text(encoding="utf-8-sig"))
+        if credentials.get("provider") == "BuilderId" and not credentials.get("profileArn"):
+            # Kiro IDE's getFixedProfileArn uses this shared service profile for
+            # BuilderId. Runtime requires it even though OIDC tokens omit it.
+            entry["profile_arn"] = "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX"
+    return [entry]
+
+
 def serve():
     if not gateway_python().is_file() or not proxy_binary().is_file():
         raise RuntimeError("Run scripts/stack.py setup first")
@@ -328,7 +340,7 @@ def serve():
                         continue
                     folder = directory / "accounts" / name
                     available(account["port"])
-                    atomic_json(folder / "gateway-accounts.json", [{"type": account["kind"], "path": account["credentialsFile"]}])
+                    atomic_json(folder / "gateway-accounts.json", gateway_credentials(account))
                     # Never inherit another account, auto-failover, or debug capture.
                     worker_env = {k: v for k, v in os.environ.items()
                                   if not k.startswith(("KIRO_", "ACCOUNTS_")) and k not in
@@ -428,6 +440,42 @@ def open_monitor():
         print(f"Could not open the dashboard: {error}. Run scripts/stack.py monitor in another terminal.", file=sys.stderr)
 
 
+@contextlib.contextmanager
+def routed_claude_arguments(arguments):
+    """Override stale settings routes only for this invocation, preserving other settings."""
+    forwarded = []
+    settings = {}
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument == "--":
+            forwarded.extend(arguments[index:])
+            break
+        if argument == "--settings" or argument.startswith("--settings="):
+            if argument == "--settings":
+                index += 1
+                if index >= len(arguments):
+                    raise ValueError("--settings requires a file path or JSON object")
+                value = arguments[index]
+            else:
+                value = argument.split("=", 1)[1]
+            settings = json.loads(value if value.lstrip().startswith("{") else Path(value).expanduser().read_text(encoding="utf-8-sig"))
+        else:
+            forwarded.append(argument)
+        index += 1
+    if not isinstance(settings, dict) or not isinstance(settings.get("env", {}), dict):
+        raise ValueError("Claude settings and their env field must be JSON objects")
+    settings["env"] = {**settings.get("env", {}),
+                       "ANTHROPIC_BASE_URL": f"http://127.0.0.1:{CAVE_PORT}/w/claude",
+                       "ANTHROPIC_AUTH_TOKEN": "unused"}
+    # A supplied settings file may contain secrets. Keep merged settings private
+    # and off the process command line, with one file per concurrent invocation.
+    with tempfile.TemporaryDirectory(prefix="claude-", dir=state_dir()) as folder:
+        path = Path(folder) / "settings.json"
+        atomic_json(path, settings)
+        yield ["--settings", str(path), *forwarded]
+
+
 def run_claude(arguments):
     registry = read_accounts()
     model = requested_model(arguments)
@@ -455,11 +503,12 @@ def run_claude(arguments):
         script = Path(executable).parent / "node_modules/@caveman-ai/cli/dist/index.js"
         if not script.is_file():
             raise RuntimeError("Set CCP_CAVEMAN_BIN to the Caveman executable, or install @caveman-ai/cli globally")
-        command = [shutil.which("node") or "node", str(script), "claude", *arguments]
+        command = [shutil.which("node") or "node", str(script), "claude"]
     else:
-        command = [executable, "claude", *arguments]
+        command = [executable, "claude"]
     open_monitor()
-    return subprocess.call(command, env=launch_env())
+    with routed_claude_arguments(arguments) as routed:
+        return subprocess.call([*command, *routed], env=launch_env())
 
 
 def main(argv=None):

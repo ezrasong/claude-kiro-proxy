@@ -57,7 +57,12 @@ the profile activation line to undo persistent activation.
 
 Claude Code does not need an Anthropic subscription login for this local route.
 The launcher supplies a local placeholder credential; real authentication belongs
-to the selected Kiro account or the main proxy's other providers. If Claude Code
+to the selected Kiro account or the main proxy's other providers. It supplies a
+private temporary `--settings` overlay so existing Claude settings cannot route
+the session to an older gateway. Your own `--settings` are preserved except for
+the local route and placeholder credential; original files are left in place.
+Builder ID credentials without a profile ARN use the same shared service profile
+as Kiro IDE. Explicit account profile ARNs are preserved. If Claude Code
 asks you to sign in, ensure the launcher is active in that terminal. Verify the
 actual launch path without making a model request:
 

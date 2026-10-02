@@ -1,11 +1,13 @@
 """Controller tests run without provider credentials or paid API calls."""
 import importlib.util
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -66,6 +68,21 @@ class StackTests(unittest.TestCase):
         self.assertEqual(stack.read_accounts(), original)
         self.assertEqual(list(stack.state_dir().glob(".write-*")), [])
 
+    def test_builder_id_uses_kiro_service_profile_without_overwriting_saved_profiles(self):
+        account = {"kind": "json", "credentialsFile": str(self.creds)}
+        for credentials, needs_profile in [
+            ({"provider": "BuilderId"}, True),
+            ({"provider": "BuilderId", "profileArn": "explicit-profile"}, False),
+            ({"provider": "Google"}, False),
+            ({}, False),
+        ]:
+            self.creds.write_text(json.dumps(credentials), encoding="utf-8")
+            entry = stack.gateway_credentials(account)[0]
+            self.assertEqual("profile_arn" in entry, needs_profile)
+            self.assertEqual(entry["path"], str(self.creds))
+            self.assertEqual(json.loads(self.creds.read_text()), credentials)
+        self.assertEqual(stack.gateway_credentials({**account, "kind": "sqlite"}), [{"type": "sqlite", "path": str(self.creds)}])
+
     def test_os_lock_prevents_second_owner_and_releases(self):
         # Check the same lock in a separate interpreter, without launching servers.
         script = f"import sys; sys.path.insert(0, {str(Path(stack.__file__).parent)!r}); import stack;\nwith stack.locked('service.lock', wait=False): print('owned')"
@@ -81,7 +98,8 @@ class StackTests(unittest.TestCase):
         with patch.object(stack, "ensure_running"), patch.object(stack.shutil, "which", return_value="caveman"), patch.object(stack.subprocess, "call", return_value=13) as call:
             self.assertEqual(stack.run_claude(["--model", "gpt-6-sol", "-p", "spaces & quotes stay intact"]), 13)
         command = call.call_args.args[0]
-        self.assertEqual(command[1:], ["claude", "--model", "gpt-6-sol", "-p", "spaces & quotes stay intact"])
+        self.assertEqual(command[1:3], ["claude", "--settings"])
+        self.assertEqual(command[4:], ["--model", "gpt-6-sol", "-p", "spaces & quotes stay intact"])
         env = call.call_args.kwargs["env"]
         self.assertEqual(env["CAVE_GATEWAY_URL"], "http://127.0.0.1:18764")
         self.assertIn("127.0.0.1:18765", env["CAVE_SSRF_ALLOWLIST"])
@@ -95,6 +113,60 @@ class StackTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     stack.run_claude([])
                 start.assert_not_called()
+
+    def test_kiro_launcher_passes_gateway_bearer_auth_before_starting_claude(self):
+        requests = []
+
+        class Gateway(BaseHTTPRequestHandler):
+            def do_GET(self):
+                requests.append((self.path, self.headers.get("Authorization")))
+                if requests[-1] != ("/v1/models", "Bearer local-test-key"):
+                    self.send_error(401)
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"data": []}')
+
+            def log_message(self, *_args):
+                pass
+
+        with ThreadingHTTPServer(("127.0.0.1", 0), Gateway) as gateway:
+            thread = threading.Thread(target=gateway.serve_forever, daemon=True)
+            thread.start()
+            registry = {"active": "paid-a", "accounts": {"paid-a": {
+                "baseUrl": f"http://127.0.0.1:{gateway.server_port}", "apiKey": "local-test-key"}}}
+            try:
+                # Exercise the HTTP contract directly so a broken header fails
+                # immediately, without the launcher's startup retry timeout.
+                self.assertEqual(stack.http_json(registry["accounts"]["paid-a"]["baseUrl"] + "/v1/models", "local-test-key"), {"data": []})
+                with patch.object(stack, "read_accounts", return_value=registry), patch.object(stack, "ensure_running"), patch.object(stack, "open_monitor"), patch.object(stack.shutil, "which", return_value="caveman"), patch.object(stack.subprocess, "call", return_value=0) as call:
+                    self.assertEqual(stack.run_claude(["--model", "kiro:claude-sonnet-4-5"]), 0)
+                self.assertEqual(call.call_args.args[0][4:], ["--model", "kiro:claude-sonnet-4-5"])
+                self.assertEqual(len(requests), 2)
+            finally:
+                gateway.shutdown()
+                thread.join(timeout=5)
+
+    def test_session_route_preserves_custom_settings_and_cleans_up_private_overlay(self):
+        original = {"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:8787/w/claude", "EXAMPLE": "preserved"},
+                    "permissions": {"defaultMode": "default"}}
+        source = self.root / "custom settings.json"
+        source.write_text(json.dumps(original), encoding="utf-8")
+        for flag in [["--settings", str(source)], ["--settings=" + json.dumps(original)]]:
+            with stack.routed_claude_arguments([*flag, "--model", "sonnet", "--", "literal --settings"]) as arguments:
+                path = Path(arguments[1])
+                settings = json.loads(path.read_text(encoding="utf-8"))
+                self.assertEqual(settings["env"]["ANTHROPIC_BASE_URL"], "http://127.0.0.1:18764/w/claude")
+                self.assertEqual(settings["env"]["ANTHROPIC_AUTH_TOKEN"], "unused")
+                self.assertEqual(settings["env"]["EXAMPLE"], "preserved")
+                self.assertEqual(settings["permissions"], original["permissions"])
+                self.assertEqual(arguments[2:], ["--model", "sonnet", "--", "literal --settings"])
+            self.assertFalse(path.exists())
+        self.assertEqual(json.loads(source.read_text()), original)
+        for invalid in [["--settings"], ["--settings", '{"env":null}'], ["--settings", '{invalid}']]:
+            with self.assertRaises(ValueError), stack.routed_claude_arguments(invalid):
+                pass
 
     def test_monitor_attaches_to_service_and_releases_its_lock_on_exit(self):
         with patch.object(stack, "ensure_running") as start, patch.object(stack.subprocess, "call", return_value=0) as call:

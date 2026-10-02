@@ -14,7 +14,8 @@ caveman claude --model kiro:claude-sonnet-4-5
 caveman claude --model gpt-6-sol
 ```
 
-Both backends stay available. Claude arguments pass through unchanged.
+Both backends stay available. Claude arguments pass through; supplied `--settings`
+are merged with the session's local proxy route without changing your settings files.
 The launcher automatically starts the services when needed.
 The Windows installer activates this terminal and new PowerShell terminals.
 For temporary activation only, use `. ./scripts/activate.ps1` instead.
