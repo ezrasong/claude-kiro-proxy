@@ -30,7 +30,7 @@ git clone --recurse-submodules https://github.com/ezrasong/claude-kiro-proxy.git
 cd claude-kiro-proxy
 python scripts/stack.py setup
 python scripts/stack.py account add paid-a
-. ./scripts/activate.ps1
+./scripts/install.ps1
 caveman claude --model kiro:claude-sonnet-4-5
 ```
 
@@ -47,11 +47,26 @@ in a separate console. The dashboard can stay open across Claude sessions;
 closing it leaves the background proxies running. Noninteractive runs do not
 open a window. On other platforms, open the dashboard in another terminal with
 `python3 scripts/stack.py monitor`.
-Add `. 'C:/full/path/to/claude-kiro-proxy/scripts/activate.ps1'` to your PowerShell
-`$PROFILE` to activate in every new terminal. Otherwise dot-source it once per
-terminal. Only `caveman claude` enters this stack; other Caveman commands use
+The Windows installer preserves and backs up existing profiles, then adds the
+activation line to current-user Windows PowerShell and PowerShell 7 profiles.
+New terminals automatically use the launcher. For temporary activation only,
+dot-source `scripts/activate.ps1` once per terminal. Only `caveman claude` enters
+this stack; other Caveman commands use
 your existing installation. Closing the terminal removes the functions; remove
-the profile line to undo persistent activation.
+the profile activation line to undo persistent activation.
+
+Claude Code does not need an Anthropic subscription login for this local route.
+The launcher supplies a local placeholder credential; real authentication belongs
+to the selected Kiro account or the main proxy's other providers. If Claude Code
+asks you to sign in, ensure the launcher is active in that terminal. Verify the
+actual launch path without making a model request:
+
+```powershell
+caveman claude --model kiro:claude-sonnet-4-5 auth status
+```
+
+This should report `loggedIn: true` for the local credential. It does not mean
+you signed into an Anthropic subscription.
 
 For Codex models, authenticate through the main proxy once:
 

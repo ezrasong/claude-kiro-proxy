@@ -8,7 +8,7 @@ Caveman in front, and a manual swapper for your paid Kiro accounts.
 python scripts/stack.py setup
 # Sign in through Kiro, then save that account:
 python scripts/stack.py account add paid-a
-. ./scripts/activate.ps1
+./scripts/install.ps1
 
 caveman claude --model kiro:claude-sonnet-4-5
 caveman claude --model gpt-6-sol
@@ -16,6 +16,8 @@ caveman claude --model gpt-6-sol
 
 Both backends stay available. Claude arguments pass through unchanged.
 The launcher automatically starts the services when needed.
+The Windows installer activates this terminal and new PowerShell terminals.
+For temporary activation only, use `. ./scripts/activate.ps1` instead.
 On Windows, interactive launches also open the original Claude proxy dashboard
 in a separate terminal. Closing the dashboard leaves the services running.
 Open it manually with `python scripts/stack.py monitor`.

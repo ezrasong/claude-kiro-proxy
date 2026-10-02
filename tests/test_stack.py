@@ -124,6 +124,13 @@ class StackTests(unittest.TestCase):
             stack.open_monitor()
             spawn.assert_not_called()
 
+    def test_worker_unicode_banner_survives_redirected_legacy_windows_encoding(self):
+        log = self.root / "unicode-worker.log"
+        env = {**os.environ, "PYTHONIOENCODING": "cp1252"}
+        child = stack.start_child([sys.executable, "-c", "print('\\U0001f47b gateway')"], env, log)
+        self.assertEqual(child.wait(timeout=10), 0)
+        self.assertIn("\U0001f47b gateway", log.read_text(encoding="utf-8"))
+
 
 if __name__ == "__main__":
     unittest.main()

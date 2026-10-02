@@ -262,7 +262,9 @@ def available(port):
 
 def start_child(command, env, log):
     with log.open("ab") as output:
-        return subprocess.Popen(command, env=env, cwd=ROOT, stdin=subprocess.DEVNULL,
+        # Gateway banners contain Unicode; redirected Windows stdout defaults
+        # to CP1252 and otherwise crashes before the server starts.
+        return subprocess.Popen(command, env={**env, "PYTHONIOENCODING": "utf-8"}, cwd=ROOT, stdin=subprocess.DEVNULL,
                                 stdout=output, stderr=output,
                                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
 
