@@ -128,11 +128,15 @@ def read_accounts():
             raise ValueError("Invalid local gateway connection")
         if account.get("kind") not in ("json", "sqlite"):
             raise ValueError("Invalid credential type")
+        if not isinstance(account.get("deleting", False), bool):
+            raise ValueError("Invalid account deletion state")
         expected = state_dir() / "accounts" / name / ("token.json" if account["kind"] == "json" else "data.sqlite3")
         if Path(account.get("credentialsFile", "")).resolve() != expected:
             raise ValueError("Credential path must stay inside its account directory")
     if value.get("active") is not None and value["active"] not in value["accounts"]:
         raise ValueError("Selected account does not exist")
+    if value.get("active") is not None and value["accounts"][value["active"]].get("deleting"):
+        raise ValueError("Selected account is being deleted")
     return value
 
 
@@ -196,11 +200,73 @@ def add_account(name, source, kind="json"):
 def use_account(name):
     with locked("accounts.lock"):
         registry = read_accounts()
-        if name not in registry["accounts"]:
+        if name not in registry["accounts"] or registry["accounts"][name].get("deleting"):
             raise ValueError("Unknown account; run account list")
         registry["active"] = name
         atomic_json(state_dir() / "kiro-accounts.json", registry)
     print(f"Selected {name} for new Kiro requests. Existing responses continue on their original account.")
+
+
+def account_directory(name):
+    """Validate the exact deletion target before changing state or removing files."""
+    if not NAME.fullmatch(name):
+        raise ValueError("Invalid account name")
+    directory = state_dir() / "accounts" / name
+    if directory.resolve() != directory:
+        raise ValueError("Account directory must not redirect outside its saved location")
+    return directory
+
+
+def cleanup_deleted_accounts(registry, workers, children):
+    """Called under accounts.lock by the supervisor, or while holding service.lock."""
+    for name, account in list(registry["accounts"].items()):
+        if not account.get("deleting"):
+            continue
+        folder = account_directory(name)
+        worker = workers.get(name)
+        if worker is not None:
+            stop_child(worker)
+            del workers[name]
+            children.remove(worker)
+        try:
+            if folder.exists():
+                shutil.rmtree(folder)
+        except OSError:
+            # Retain the tombstone and port reservation until cleanup succeeds.
+            continue
+        _secured.discard(folder)
+        del registry["accounts"][name]
+        atomic_json(state_dir() / "kiro-accounts.json", registry)
+
+
+def delete_account(name):
+    account_directory(name)
+    with locked("accounts.lock"):
+        registry = read_accounts()
+        if name not in registry["accounts"]:
+            raise ValueError("Unknown account; run account list")
+        registry["accounts"][name]["deleting"] = True
+        if registry["active"] == name:
+            registry["active"] = None
+        atomic_json(state_dir() / "kiro-accounts.json", registry)
+    # The running supervisor owns process shutdown. If it is absent or crashes,
+    # take its lock before cleaning up; never race a new supervisor or import.
+    deadline = time.monotonic() + 30
+    while name in read_accounts()["accounts"]:
+        try:
+            with locked("service.lock", wait=False):
+                with locked("accounts.lock"):
+                    cleanup_deleted_accounts(read_accounts(), {}, [])
+        except RuntimeError:
+            pass  # A live supervisor will complete the requested deletion.
+        if name not in read_accounts()["accounts"]:
+            break
+        if time.monotonic() >= deadline:
+            raise RuntimeError("Deletion is pending; credentials could not be removed yet. Check file permissions and retry.")
+        time.sleep(0.25)
+    print(f"Deleted saved account {name} and its proxy credentials/logs. Chrome and Kiro logins were left in place.")
+    if read_accounts()["active"] is None:
+        print("No active Kiro account. Run kiro-account use <name> to select one.")
 
 
 def gateway_python():
@@ -334,27 +400,29 @@ def serve():
             while not stopping and not (directory / "stop").exists():
                 if proxy.poll() is not None:
                     raise RuntimeError("Claude proxy exited; inspect proxy.log")
-                registry = read_accounts()
-                for name, account in registry["accounts"].items():
-                    if name in workers:
-                        continue
-                    folder = directory / "accounts" / name
-                    available(account["port"])
-                    atomic_json(folder / "gateway-accounts.json", gateway_credentials(account))
-                    # Never inherit another account, auto-failover, or debug capture.
-                    worker_env = {k: v for k, v in os.environ.items()
-                                  if not k.startswith(("KIRO_", "ACCOUNTS_")) and k not in
-                                  ("REFRESH_TOKEN", "PROFILE_ARN", "PROXY_API_KEY", "ACCOUNT_SYSTEM", "DEBUG_MODE")}
-                    worker_env.update({"PROXY_API_KEY": account["apiKey"], "SERVER_HOST": "127.0.0.1",
-                                       "SERVER_PORT": str(account["port"]), "ACCOUNT_SYSTEM": "false", "DEBUG_MODE": "off",
-                                       "ACCOUNTS_CONFIG_FILE": str(folder / "gateway-accounts.json"),
-                                       "ACCOUNTS_STATE_FILE": str(folder / "gateway-state.json")})
-                    worker = start_child([str(gateway_python()), str(GATEWAY / "main.py"),
-                                          "--host", "127.0.0.1", "--port", str(account["port"])], worker_env, folder / "gateway.log")
-                    children.append(worker)
-                    workers[name] = worker
-                    # One bad account must not prevent other providers or accounts working.
-                    print(f"Starting Kiro account {name}; log: {folder / 'gateway.log'}", flush=True)
+                with locked("accounts.lock"):
+                    registry = read_accounts()
+                    cleanup_deleted_accounts(registry, workers, children)
+                    for name, account in registry["accounts"].items():
+                        if name in workers or account.get("deleting"):
+                            continue
+                        folder = directory / "accounts" / name
+                        available(account["port"])
+                        atomic_json(folder / "gateway-accounts.json", gateway_credentials(account))
+                        # Never inherit another account, auto-failover, or debug capture.
+                        worker_env = {k: v for k, v in os.environ.items()
+                                      if not k.startswith(("KIRO_", "ACCOUNTS_")) and k not in
+                                      ("REFRESH_TOKEN", "PROFILE_ARN", "PROXY_API_KEY", "ACCOUNT_SYSTEM", "DEBUG_MODE")}
+                        worker_env.update({"PROXY_API_KEY": account["apiKey"], "SERVER_HOST": "127.0.0.1",
+                                           "SERVER_PORT": str(account["port"]), "ACCOUNT_SYSTEM": "false", "DEBUG_MODE": "off",
+                                           "ACCOUNTS_CONFIG_FILE": str(folder / "gateway-accounts.json"),
+                                           "ACCOUNTS_STATE_FILE": str(folder / "gateway-state.json")})
+                        worker = start_child([str(gateway_python()), str(GATEWAY / "main.py"),
+                                              "--host", "127.0.0.1", "--port", str(account["port"])], worker_env, folder / "gateway.log")
+                        children.append(worker)
+                        workers[name] = worker
+                        # One bad account must not prevent other providers or accounts working.
+                        print(f"Starting Kiro account {name}; log: {folder / 'gateway.log'}", flush=True)
                 if not marker.exists():
                     atomic_json(marker, {"ready": True, "pid": os.getpid()})
                     open_monitor()
@@ -530,6 +598,8 @@ def main(argv=None):
     accounts.add_parser("list")
     use = accounts.add_parser("use")
     use.add_argument("name")
+    delete = accounts.add_parser("delete", help="Stop an account gateway and delete its saved credentials/logs; interrupts its active responses")
+    delete.add_argument("name")
     args = parser.parse_args(argv)
     if args.command == "setup":
         setup()
@@ -549,6 +619,8 @@ def main(argv=None):
         add_account(args.name, args.sqlite or args.creds, "sqlite" if args.sqlite else "json")
     elif args.command == "account" and args.action == "use":
         use_account(args.name)
+    elif args.command == "account" and args.action == "delete":
+        delete_account(args.name)
     else:
         if args.command == "status":
             print("Stack is running" if running() else "Stack is stopped or starting")
@@ -556,7 +628,7 @@ def main(argv=None):
         if not registry["accounts"]:
             print("No Kiro accounts saved. Run account add after signing in to Kiro.")
         for name, account in registry["accounts"].items():
-            print(f"{'*' if name == registry['active'] else ' '} {name} ({account['kind']})")
+            print(f"{'*' if name == registry['active'] else ' '} {name} ({account['kind']}){' - deletion pending' if account.get('deleting') else ''}")
     return 0
 
 

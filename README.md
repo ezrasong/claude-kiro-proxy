@@ -28,10 +28,15 @@ Open it manually with `python scripts/stack.py monitor`.
 kiro-account add paid-b
 kiro-account list
 kiro-account use paid-b
+# Delete a saved account and its proxy credentials/logs:
+kiro-account delete paid-a
 ```
 
 Swaps affect new Kiro requests. Existing streams finish on their original account.
 Accounts do not rotate automatically. Saved credentials stay outside the repo.
+Deleting an account stops its gateway and interrupts its active responses.
+Deleting the active account clears selection; use `kiro-account use <name>` to
+select another one. Chrome profiles and the Kiro installation login are preserved.
 Codex models use the main proxy's existing login:
 `./target/release/claude-code-proxy.exe codex auth login`.
 

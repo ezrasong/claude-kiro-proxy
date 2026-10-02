@@ -109,6 +109,15 @@ The first imported account becomes active. Later imports do not change selection
 Rate-limit and quota errors remain attached to the selected account until you
 manually select another one.
 
+Remove a saved account with `kiro-account delete <name>`. This stops only its
+gateway and deletes its saved proxy credentials, gateway state, and logs. Active
+responses on that account are interrupted. Chrome profiles and the source Kiro
+login are preserved. Deleting the active account clears selection; select another
+one explicitly with `kiro-account use <name>`. Once deletion completes, its name
+can be imported again. A pending deletion reserves the name and port until its
+worker has stopped and its saved files have been removed; retry if cleanup was
+blocked by file permissions.
+
 Other credential locations and Kiro CLI databases are supported:
 
 ```powershell

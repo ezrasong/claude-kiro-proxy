@@ -51,6 +51,77 @@ class StackTests(unittest.TestCase):
             stack.add_account("bad", self.creds)
         self.assertEqual(stack.read_accounts()["accounts"], {})
 
+    def test_delete_inactive_and_active_accounts_preserves_source_and_manual_selection(self):
+        stack.add_account("a", self.creds)
+        stack.add_account("b", self.creds)
+        folder = stack.state_dir() / "accounts" / "b"
+        (folder / "gateway.log").write_text("private account log")
+        self.assertEqual(stack.main(["account", "delete", "b"]), 0)
+        self.assertFalse(folder.exists())
+        self.assertEqual(stack.read_accounts()["active"], "a")
+        self.assertTrue(self.creds.exists())
+        with self.assertRaises(ValueError):
+            stack.delete_account("missing")
+        with self.assertRaises(ValueError):
+            stack.delete_account("../outside")
+        stack.add_account("b", self.creds)
+        stack.delete_account("a")
+        self.assertIsNone(stack.read_accounts()["active"])
+        self.assertIn("b", stack.read_accounts()["accounts"])
+        stack.use_account("b")
+        self.assertEqual(stack.read_accounts()["active"], "b")
+
+    def test_delete_stops_only_owned_worker_before_removing_files(self):
+        stack.add_account("a", self.creds)
+        stack.add_account("b", self.creds)
+        registry = stack.read_accounts()
+        registry["accounts"]["b"]["deleting"] = True
+        stack.atomic_json(stack.state_dir() / "kiro-accounts.json", registry)
+        worker = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
+                                  creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+        self.addCleanup(stack.stop_child, worker)
+        workers = {"b": worker}
+        other = object()
+        children = [other, worker]
+        remove = stack.shutil.rmtree
+
+        def stopped_before_remove(path):
+            self.assertIsNotNone(worker.poll())
+            remove(path)
+
+        with stack.locked("accounts.lock"), patch.object(stack.shutil, "rmtree", side_effect=stopped_before_remove):
+            stack.cleanup_deleted_accounts(registry, workers, children)
+        self.assertEqual(workers, {})
+        self.assertEqual(children, [other])
+        self.assertEqual(list(stack.read_accounts()["accounts"]), ["a"])
+        self.assertTrue(Path(registry["accounts"]["a"]["credentialsFile"]).exists())
+
+    def test_failed_cleanup_reserves_name_and_port_until_retry(self):
+        stack.add_account("a", self.creds)
+        original_port = stack.read_accounts()["accounts"]["a"]["port"]
+        with patch.object(stack.shutil, "rmtree", side_effect=PermissionError("locked")), patch.object(stack.time, "monotonic", side_effect=[0, 31]):
+            with self.assertRaisesRegex(RuntimeError, "Deletion is pending"):
+                stack.delete_account("a")
+        self.assertTrue(stack.read_accounts()["accounts"]["a"]["deleting"])
+        with self.assertRaises(ValueError):
+            stack.use_account("a")
+        with self.assertRaises(ValueError):
+            stack.add_account("a", self.creds)
+        stack.add_account("b", self.creds)
+        self.assertNotEqual(stack.read_accounts()["accounts"]["b"]["port"], original_port)
+        stack.delete_account("a")
+        self.assertNotIn("a", stack.read_accounts()["accounts"])
+        self.assertEqual(stack.read_accounts()["active"], "b")
+
+    def test_delete_refuses_redirected_directory_before_mutation(self):
+        stack.add_account("a", self.creds)
+        original = stack.read_accounts()
+        with patch.object(stack.Path, "resolve", return_value=self.root / "outside"), patch.object(stack.shutil, "rmtree") as remove:
+            with self.assertRaises(ValueError):
+                stack.delete_account("a")
+            remove.assert_not_called()
+        self.assertEqual(stack.read_accounts(), original)
+
     def test_oidc_device_registration_is_saved_with_account(self):
         self.creds.write_text(json.dumps({"refreshToken": "r", "clientIdHash": "device-hash"}))
         (self.root / "device-hash.json").write_text(json.dumps({"clientId": "id", "clientSecret": "secret"}))
