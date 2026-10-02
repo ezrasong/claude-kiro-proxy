@@ -18,6 +18,10 @@ caveman claude --model gpt-6-sol
 Both backends stay available. Claude arguments pass through; supplied `--settings`
 are merged with the session's local proxy route without changing your settings files.
 The launcher automatically starts the services when needed.
+It also adds a session-only Claude Code Stop checker: unfinished authorized work
+is sent back into the same task loop. Existing hooks and permissions are preserved.
+The checker uses an additional model call when Claude tries to finish; see
+[completion behavior and limits](docs/KIRO.md#task-completion).
 The Windows installer activates this terminal and new PowerShell terminals.
 For temporary activation only, use `. ./scripts/activate.ps1` instead.
 On Windows, interactive launches also open the original Claude proxy dashboard

@@ -292,7 +292,9 @@ class StackTests(unittest.TestCase):
 
     def test_session_route_preserves_custom_settings_and_cleans_up_private_overlay(self):
         original = {"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:8787/w/claude", "EXAMPLE": "preserved"},
-                    "permissions": {"defaultMode": "default"}}
+                    "permissions": {"defaultMode": "default"},
+                    "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "existing-stop"}]}],
+                              "PreToolUse": [{"matcher": "Bash", "hooks": []}]}}
         source = self.root / "custom settings.json"
         source.write_text(json.dumps(original), encoding="utf-8")
         for flag in [["--settings", str(source)], ["--settings=" + json.dumps(original)]]:
@@ -303,12 +305,27 @@ class StackTests(unittest.TestCase):
                 self.assertEqual(settings["env"]["ANTHROPIC_AUTH_TOKEN"], "unused")
                 self.assertEqual(settings["env"]["EXAMPLE"], "preserved")
                 self.assertEqual(settings["permissions"], original["permissions"])
+                self.assertEqual(settings["hooks"]["Stop"][:-1], original["hooks"]["Stop"])
+                self.assertEqual(settings["hooks"]["PreToolUse"], original["hooks"]["PreToolUse"])
+                self.assertEqual(settings["hooks"]["Stop"][-1]["hooks"][0]["type"], "prompt")
                 self.assertEqual(arguments[2:], ["--model", "sonnet", "--", "literal --settings"])
             self.assertFalse(path.exists())
         self.assertEqual(json.loads(source.read_text()), original)
-        for invalid in [["--settings"], ["--settings", '{"env":null}'], ["--settings", '{invalid}']]:
+        for invalid in [["--settings"], ["--settings", '{"env":null}'], ["--settings", '{invalid}'],
+                        ["--settings", '{"hooks":null}'], ["--settings", '{"hooks":{"Stop":{}}}']]:
             with self.assertRaises(ValueError), stack.routed_claude_arguments(invalid):
                 pass
+
+    def test_continuation_overlay_is_private_to_each_launch(self):
+        with stack.routed_claude_arguments([]) as first:
+            first_path = Path(first[1])
+            with stack.routed_claude_arguments([]) as second:
+                second_path = Path(second[1])
+                self.assertNotEqual(first_path, second_path)
+                self.assertEqual(json.loads(first_path.read_text()), json.loads(second_path.read_text()))
+            self.assertFalse(second_path.exists())
+            self.assertTrue(first_path.exists())
+        self.assertFalse(first_path.exists())
 
     def test_monitor_attaches_to_service_and_releases_its_lock_on_exit(self):
         with patch.object(stack, "ensure_running") as start, patch.object(stack.subprocess, "call", return_value=0) as call:

@@ -172,6 +172,39 @@ monitoring and malformed-stream handling share the main proxy's existing native
 Anthropic passthrough implementation. HTTP errors preserve status and `Retry-After`
 without exposing gateway error bodies or credentials.
 
+## Task completion
+
+`caveman claude` adds Claude Code's native prompt-based `Stop` hook through its
+private per-launch settings overlay. It reviews the requested scope and transcript
+evidence, including relevant verification. Plans, partial progress and offers to
+continue do not count as completion. When work remains, its feedback sends Claude
+back into the same session to take the next concrete step. Questions and status
+requests are evaluated against their own scope.
+
+This adds a model evaluation when Claude tries to stop, with additional latency
+and model usage. The evaluator uses Claude Code's model selection and the session's
+proxy route. It is a best-effort evidence check, not a guarantee that
+arbitrary tasks can be completed. Missing access or required input, upstream
+refusals, exhausted limits and user cancellation remain valid stopping reasons.
+The checker cannot run tools or grant permissions; existing hooks and permissions
+are retained, including `disableAllHooks` if you have set it.
+
+Claude Code's native limits still apply: the installed version allows eight
+consecutive automatic continuations before ending the turn with a warning on
+the ninth rejected stop. Explicit `--max-turns` and budget limits still apply.
+Checker errors or timeouts follow Claude Code's hook error behavior. These cases
+do not establish that the requested task is complete.
+
+Press Ctrl+C to interrupt. The hook is added on launch, so an already-open Claude
+session needs to be exited and resumed from the same project directory:
+
+```powershell
+caveman claude --continue --model kiro:claude-sonnet-4-5
+```
+
+Global and project settings files are not modified. The temporary overlay is
+removed when the launcher exits, and account switching stays manual.
+
 ## Services and troubleshooting
 
 ```powershell
@@ -208,8 +241,10 @@ The proxy preserves tool results and user text without adding continuation promp
 
 Setup and service startup apply `patches/kiro-refusals.patch` to the pinned gateway.
 This patch surfaces Kiro refusal metadata as a visible explanation and a `refusal`
-stop reason (OpenAI: `content_filter`), instead of an empty success. Refusals are
-not retried or routed to another account. The service's suggested options are to
+stop reason (OpenAI: `content_filter`), instead of an empty success. The gateway,
+main proxy and completion checker do not retry refusals or route them to another
+account. Claude Code may make its own built-in recovery attempt before reporting
+a refusal. The service's suggested options are to
 select another model, start a new conversation, or rewind to an earlier point.
 
 Listeners bind to loopback. The main proxy retains upstream's local-client trust
@@ -258,6 +293,16 @@ against a local mock Kiro gateway (no paid calls), run:
 ```powershell
 python tests/smoke_caveman.py --caveman-bin "$HOME/.caveman/bin/caveman-proxy.exe"
 ```
+
+To verify the installed Claude Code continuation loop without paid calls:
+
+```powershell
+python tests/smoke_completion.py --claude-bin "$HOME/.local/bin/claude.exe"
+```
+
+This deliberately simulates an early stop, checks the subsequent permitted tool
+call and completion, preserves existing Stop hooks from two settings scopes,
+and covers completed work, blockers, refusals and the native no-progress limit.
 
 Upstream source and history are retained. Claude Code Proxy is MIT licensed;
 the Kiro Gateway submodule and its downstream patch are separately AGPL-3.0 licensed. This repo
