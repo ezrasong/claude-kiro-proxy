@@ -232,6 +232,86 @@ async fn embedded_system_messages_use_native_field_for_generation_and_token_coun
 }
 
 #[tokio::test]
+async fn tool_result_only_followups_continue_in_streaming_buffered_and_count_requests() {
+    let (url, gateway, task) = gateway("continued-answer", StatusCode::OK).await;
+    let dir = TempDir::new().unwrap();
+    let file = dir.path().join("accounts.json");
+    std::fs::write(
+        &file,
+        json!({"active":"a","accounts":{"a":{"baseUrl":url,"apiKey":"a"}}}).to_string(),
+    )
+    .unwrap();
+    let provider = KiroProvider::with_accounts_file(file);
+    let mut body = request(false);
+    let history = json!([
+        {"role":"user","content":"Check both values and report the result."},
+        {"role":"assistant","content":[
+            {"type":"tool_use","id":"toolu_a","name":"read","input":{"path":"a"}},
+            {"type":"tool_use","id":"toolu_b","name":"read","input":{"path":"b"}}
+        ]},
+        {"role":"user","content":[
+            {"type":"tool_result","tool_use_id":"toolu_a","content":[{"type":"text","text":"value a"}],"cache_control":{"type":"ephemeral"}},
+            {"type":"tool_result","tool_use_id":"toolu_b","content":"not found","is_error":true}
+        ]}
+    ]);
+    body.messages = serde_json::from_value(history.clone()).unwrap();
+    assert_eq!(
+        value(provider.handle_messages(body.clone(), ctx()).await).await["content"][0]["text"],
+        "continued-answer"
+    );
+    body.stream = true;
+    gateway.release.notify_one();
+    let response = provider.handle_messages(body.clone(), ctx()).await;
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    assert!(String::from_utf8_lossy(&bytes).contains("continued-answer"));
+    assert_eq!(
+        value(provider.handle_count_tokens(body, ctx()).await).await["input_tokens"],
+        123
+    );
+    let captured = gateway.requests.lock().unwrap();
+    assert_eq!(captured.len(), 3);
+    for (_, payload) in captured.iter() {
+        assert_eq!(payload["messages"][0], history[0]);
+        assert_eq!(payload["messages"][1], history[1]);
+        let blocks = payload["messages"][2]["content"].as_array().unwrap();
+        assert_eq!(&blocks[..2], history[2]["content"].as_array().unwrap());
+        assert_eq!(
+            blocks[2],
+            json!({"type":"text","text":"Continue using these tool results."})
+        );
+    }
+    task.abort();
+}
+
+#[tokio::test]
+async fn tool_continuation_preserves_explicit_text_and_other_messages() {
+    let (url, gateway, task) = gateway("unchanged", StatusCode::OK).await;
+    let dir = TempDir::new().unwrap();
+    let file = dir.path().join("accounts.json");
+    std::fs::write(
+        &file,
+        json!({"active":"a","accounts":{"a":{"baseUrl":url,"apiKey":"a"}}}).to_string(),
+    )
+    .unwrap();
+    let provider = KiroProvider::with_accounts_file(file);
+    for message in [
+        json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_a","content":"ok"},{"type":"text","text":"Stop here and summarize.","cache_control":{"type":"ephemeral"}}]}),
+        json!({"role":"user","content":"User instruction"}),
+        json!({"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"aGVsbG8="}}]}),
+        json!({"role":"assistant","content":[{"type":"tool_use","id":"toolu_a","name":"read","input":{}}]}),
+    ] {
+        let mut body = request(false);
+        body.messages = serde_json::from_value(json!([message.clone()])).unwrap();
+        provider.handle_messages(body, ctx()).await;
+        assert_eq!(
+            gateway.requests.lock().unwrap().last().unwrap().1["messages"],
+            json!([message])
+        );
+    }
+    task.abort();
+}
+
+#[tokio::test]
 async fn manual_selection_never_falls_back_on_quota_and_redacts_error_bodies() {
     let (url_a, _, task_a) = gateway("limited", StatusCode::TOO_MANY_REQUESTS).await;
     let (url_b, b, task_b) = gateway("other", StatusCode::OK).await;

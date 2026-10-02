@@ -200,6 +200,13 @@ frames, keeping the Claude Code connection active through Caveman. Upstream
 timeouts and stream validation still apply; keepalives do not retry requests or
 switch accounts.
 
+Claude Code normally follows a tool call with a user message containing only
+tool results. Kiro Gateway substitutes `(empty placeholder)` for that message's
+text, which can make Opus finish without replying. The Kiro adapter adds
+`Continue using these tool results.` only to the final user message when it
+contains tool results and no nonblank text. Tool data and existing instructions
+are preserved. Streaming, non-streaming and token counting use the same rule.
+
 Listeners bind to loopback. The main proxy retains upstream's local-client trust
 model; other programs on your machine can call it. The Kiro adapter only accepts
 literal loopback gateway URLs, bypasses environment HTTP proxies, and rejects
