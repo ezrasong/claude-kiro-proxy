@@ -461,6 +461,8 @@ fn redact_traffic_value(value: &Value) -> Value {
 }
 
 fn set_mode(path: &Path, mode: u32) {
+    #[cfg(not(unix))]
+    let _ = (path, mode);
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

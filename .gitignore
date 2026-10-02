@@ -2,3 +2,7 @@ node_modules/
 dist/
 .astro/
 target/
+.venv/
+__pycache__/
+.kiro-state/
+*.log

@@ -96,6 +96,21 @@ fn path_resolvers_cover_platform_rules() {
 }
 
 #[test]
+fn state_directory_override_keeps_managed_logs_in_private_stack_directory() {
+    for platform in ["windows", "win32", "linux", "darwin"] {
+        let deps = DirResolverEnv {
+            platform: platform.into(),
+            home: "/home/user".into(),
+            env: HashMap::from([("CCP_STATE_DIR".into(), "/private/main-state".into())]),
+        };
+        assert_eq!(
+            paths::resolve_state_dir(&deps),
+            std::path::PathBuf::from("/private/main-state")
+        );
+    }
+}
+
+#[test]
 fn logging_redaction_and_truncation() {
     let short =
         json!({"authorization": "abc", "visible": "x", "nested": {"set-cookie": "c", "v": "y"}});

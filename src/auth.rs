@@ -361,6 +361,8 @@ pub fn write_atomically<T: Serialize>(path: &str, value: &T) -> Result<()> {
 }
 
 fn set_mode(path: &std::path::Path, mode: u32) {
+    #[cfg(not(unix))]
+    let _ = (path, mode);
     #[cfg(unix)]
     {
         if let Ok(meta) = fs::metadata(path) {

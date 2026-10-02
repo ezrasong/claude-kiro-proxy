@@ -47,6 +47,9 @@ pub fn resolve_config_dir(deps: &DirResolverEnv) -> PathBuf {
 }
 
 pub fn resolve_state_dir(deps: &DirResolverEnv) -> PathBuf {
+    if let Some(override_dir) = deps.env.get("CCP_STATE_DIR") {
+        return Path::new(override_dir).to_path_buf();
+    }
     if deps.platform == "win32" {
         let local = deps
             .env

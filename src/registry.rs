@@ -67,6 +67,7 @@ pub struct Registry {
 impl Registry {
     pub fn new(alias_provider: AliasProvider) -> Self {
         let mut models: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        models.insert("kiro".into(), crate::providers::kiro::advertised_models());
         models.insert("codex".into(), expand_codex_models());
         models.insert(
             "kimi".into(),
@@ -93,6 +94,7 @@ impl Registry {
                 "cursor" => Arc::new(crate::providers::cursor::CursorProvider::new()),
                 "grok" => Arc::new(crate::providers::grok::GrokProvider::new()),
                 "opencode" => Arc::new(crate::providers::opencode::OpenCodeProvider::new()),
+                "kiro" => Arc::new(crate::providers::kiro::KiroProvider::new()),
                 _ => Arc::new(PlaceholderProvider::new(name, entries.clone())),
             };
             handlers.insert(name.clone(), handler);
@@ -174,6 +176,9 @@ impl Registry {
         session_affinity: Option<&AliasProvider>,
     ) -> Option<Arc<dyn Provider>> {
         let normalized = normalize_incoming_model(raw_model);
+        if normalized.starts_with("kiro:") {
+            return self.handlers.get("kiro").cloned();
+        }
         if is_anthropic_alias(&normalized) {
             let target = session_affinity.unwrap_or(&self.alias_provider);
             return self.handlers.get(target.as_str()).cloned();

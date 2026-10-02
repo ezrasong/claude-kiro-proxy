@@ -43,6 +43,8 @@ pub fn get_device_id() -> Result<String, anyhow::Error> {
 }
 
 fn set_mode(path: &std::path::Path, mode: u32) {
+    #[cfg(not(unix))]
+    let _ = (path, mode);
     #[cfg(unix)]
     {
         if let Ok(meta) = fs::metadata(path) {

@@ -1,0 +1,3 @@
+[submodule "vendor/kiro-gateway"]
+	path = vendor/kiro-gateway
+	url = https://github.com/jwadow/kiro-gateway.git
