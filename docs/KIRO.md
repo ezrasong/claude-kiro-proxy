@@ -194,6 +194,12 @@ console output, `stack.log` the background supervisor, and
 worker becoming ready. Select another account or import a fresh login. Codex
 sessions do not wait for Kiro readiness.
 
+Kiro can pause while reasoning or preparing tool calls. The main proxy sends
+Anthropic SSE `ping` events every 15 seconds during silence between complete
+frames, keeping the Claude Code connection active through Caveman. Upstream
+timeouts and stream validation still apply; keepalives do not retry requests or
+switch accounts.
+
 Listeners bind to loopback. The main proxy retains upstream's local-client trust
 model; other programs on your machine can call it. The Kiro adapter only accepts
 literal loopback gateway URLs, bypasses environment HTTP proxies, and rejects

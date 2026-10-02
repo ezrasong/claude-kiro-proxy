@@ -61,7 +61,15 @@ def main():
             self.send_header("content-type", content_type)
             self.send_header("content-length", str(len(payload)))
             self.end_headers()
-            self.wfile.write(payload)
+            if body.get("stream"):
+                first, rest = payload.split(b"\n\n", 1)
+                self.wfile.write(first + b"\n\n")
+                self.wfile.flush()
+                # Kiro can be silent while reasoning or preparing a tool call.
+                time.sleep(22)
+                self.wfile.write(rest)
+            else:
+                self.wfile.write(payload)
 
     mock = ThreadingHTTPServer(("127.0.0.1", 0), Gateway)
     thread = threading.Thread(target=mock.serve_forever, daemon=True)
@@ -106,11 +114,13 @@ def main():
                     outgoing = urllib.request.Request(f"http://127.0.0.1:{cave_port}/w/claude/v1/{endpoint}",
                         data=json.dumps(body).encode(), headers={"content-type": "application/json", "x-api-key": "unused", "anthropic-version": "2023-06-01"})
                     try:
-                        with opener.open(outgoing, timeout=15) as response:
+                        with opener.open(outgoing, timeout=20) as response:
                             output = response.read().decode()
                     except urllib.error.HTTPError as error:
                         raise RuntimeError(f"HTTP {error.code}: {error.read().decode()}\n" + (directory / "services.log").read_text()) from None
                     assert "kiro-smoke-ok" in output if endpoint == "messages" else json.loads(output)["input_tokens"] == 12
+                    if stream:
+                        assert 'event: ping' in output, "Silent Kiro streams need keepalives through Caveman"
                 assert len(captured) == 3, captured
                 for _path, headers, payload in captured:
                     assert headers.get("x-api-key") == "mock-gateway-secret", headers

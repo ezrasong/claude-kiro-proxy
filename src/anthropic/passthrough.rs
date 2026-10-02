@@ -7,6 +7,9 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 use std::convert::Infallible;
 use std::sync::Arc;
+use std::time::Duration;
+
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 
 pub fn stream_body<S, E>(
     upstream: S,
@@ -68,7 +71,27 @@ where
             return None;
         }
 
-        let chunk = match self.upstream.next().await {
+        // Native Messages gateways can be silent while reasoning or building
+        // tool arguments. Keep clients alive without changing upstream deadlines.
+        // Raw chunks may split an SSE frame: never insert a ping inside one.
+        let next = if self.decoder.finish().is_ok() {
+            match tokio::time::timeout(HEARTBEAT_INTERVAL, self.upstream.next()).await {
+                Ok(next) => next,
+                Err(_) => {
+                    let value = serde_json::json!({"type": "ping"});
+                    if let Some(capture) = self.stream_capture.as_mut() {
+                        capture.downstream_event("ping", value.clone());
+                    }
+                    return Some(Bytes::from(encode_sse_event(
+                        Some("ping"),
+                        &value.to_string(),
+                    )));
+                }
+            }
+        } else {
+            self.upstream.next().await
+        };
+        let chunk = match next {
             Some(Ok(chunk)) => chunk,
             Some(Err(_)) => return Some(self.fail_at("transport", "upstream_stream")),
             None => {
@@ -213,6 +236,72 @@ impl<S> Drop for MessagesStreamState<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http_body_util::BodyExt;
+
+    fn delayed_stream(chunks: Vec<(Duration, &'static str)>) -> Body {
+        let upstream = futures_util::stream::unfold(chunks.into_iter(), |mut chunks| async move {
+            let (delay, chunk) = chunks.next()?;
+            tokio::time::sleep(delay).await;
+            Some((
+                Ok::<_, std::io::Error>(Bytes::from_static(chunk.as_bytes())),
+                chunks,
+            ))
+        });
+        stream_body(Box::pin(upstream), "Test", None, "req".into(), None)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn silent_stream_sends_repeated_pings_then_completes() {
+        let mut body = delayed_stream(vec![
+            (
+                Duration::from_secs(31),
+                "event: message_start\ndata: {\"type\":\"message_start\"}\n\n",
+            ),
+            (
+                Duration::from_secs(31),
+                "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+            ),
+        ]);
+        for expected in [
+            "ping",
+            "ping",
+            "message_start",
+            "ping",
+            "ping",
+            "message_stop",
+        ] {
+            let data = body.frame().await.unwrap().unwrap().into_data().unwrap();
+            assert!(String::from_utf8_lossy(&data).contains(&format!("event: {expected}\n")));
+        }
+        assert!(body.frame().await.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_never_splits_an_upstream_frame() {
+        let body = delayed_stream(vec![
+            (Duration::ZERO, "event: message_stop\ndata: {\"type\":"),
+            (Duration::from_secs(31), "\"message_stop\"}\n\n"),
+        ]);
+        let bytes = body.collect().await.unwrap().to_bytes();
+        assert_eq!(
+            bytes.as_ref(),
+            b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn silent_stream_without_terminal_event_still_fails() {
+        let body = delayed_stream(vec![(
+            Duration::from_secs(31),
+            "event: message_start\ndata: {\"type\":\"message_start\"}\n\n",
+        )]);
+        let bytes = body.collect().await.unwrap().to_bytes();
+        let text = String::from_utf8_lossy(&bytes);
+        assert_eq!(text.matches("event: ping\n").count(), 2);
+        assert!(text.contains("Test Messages stream is invalid"));
+        assert!(!text.contains("event: message_stop\n"));
+    }
+
     #[tokio::test]
     async fn live_stream_rejects_an_incomplete_frame_after_message_stop() {
         let upstream =
