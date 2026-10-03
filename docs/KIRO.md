@@ -205,6 +205,23 @@ caveman claude --continue --model kiro:claude-sonnet-4-5
 Global and project settings files are not modified. The temporary overlay is
 removed when the launcher exits, and account switching stays manual.
 
+Claude Code does not need a Claude subscription login for this local route.
+The launcher supplies the local placeholder token and proxy URL in both the
+startup environment and its settings overlay. It also clears Caveman's saved
+first-party endpoint assertion for this invocation, because Kiro is a custom
+upstream. Authentication to Kiro remains with the saved account gateway.
+If an existing PowerShell terminal is using the original Caveman command,
+reload the launcher before retrying:
+
+```powershell
+. ./scripts/activate.ps1  # run from this repository
+caveman claude --model kiro:claude-opus-5-5
+```
+
+From another directory you can invoke `scripts/stack.py run -- ...` by its full
+path to avoid depending on shell activation. Claude Code's "API Usage Billing"
+banner describes its API transport; it is not a request to log into Claude.
+
 ## Services and troubleshooting
 
 ```powershell

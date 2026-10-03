@@ -291,7 +291,8 @@ class StackTests(unittest.TestCase):
                 thread.join(timeout=5)
 
     def test_session_route_preserves_custom_settings_and_cleans_up_private_overlay(self):
-        original = {"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:8787/w/claude", "EXAMPLE": "preserved"},
+        original = {"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:8787/w/claude", "EXAMPLE": "preserved",
+                            "_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL": "1"},
                     "permissions": {"defaultMode": "default"},
                     "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "existing-stop"}]}],
                               "PreToolUse": [{"matcher": "Bash", "hooks": []}]}}
@@ -303,6 +304,7 @@ class StackTests(unittest.TestCase):
                 settings = json.loads(path.read_text(encoding="utf-8"))
                 self.assertEqual(settings["env"]["ANTHROPIC_BASE_URL"], "http://127.0.0.1:18764/w/claude")
                 self.assertEqual(settings["env"]["ANTHROPIC_AUTH_TOKEN"], "unused")
+                self.assertEqual(settings["env"]["_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL"], "0")
                 self.assertEqual(settings["env"]["EXAMPLE"], "preserved")
                 self.assertEqual(settings["permissions"], original["permissions"])
                 self.assertEqual(settings["hooks"]["Stop"][:-1], original["hooks"]["Stop"])
@@ -326,6 +328,18 @@ class StackTests(unittest.TestCase):
             self.assertFalse(second_path.exists())
             self.assertTrue(first_path.exists())
         self.assertFalse(first_path.exists())
+
+    def test_proxy_route_is_available_before_settings_load_without_changing_shell(self):
+        inherited = {"ANTHROPIC_BASE_URL": "https://api.anthropic.com",
+                     "ANTHROPIC_AUTH_TOKEN": "unrelated-token",
+                     "_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL": "1"}
+        with patch.dict(os.environ, inherited):
+            environment = stack.launch_env()
+            self.assertEqual(environment["ANTHROPIC_BASE_URL"], "http://127.0.0.1:18764/w/claude")
+            self.assertEqual(environment["ANTHROPIC_AUTH_TOKEN"], "unused")
+            self.assertEqual(environment["_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL"], "0")
+            for name, value in inherited.items():
+                self.assertEqual(os.environ[name], value)
 
     def test_monitor_attaches_to_service_and_releases_its_lock_on_exit(self):
         with patch.object(stack, "ensure_running") as start, patch.object(stack.subprocess, "call", return_value=0) as call:

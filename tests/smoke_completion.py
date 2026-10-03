@@ -111,13 +111,19 @@ def run_case(executable, case):
             config.mkdir()
             global_marker = Path(folder) / "global-hook-ran"
             supplied_marker = Path(folder) / "supplied-hook-ran"
-            (config / "settings.json").write_text(json.dumps(existing_hook(global_marker)))
+            user_settings = existing_hook(global_marker)
+            user_settings["env"] = {"_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL": "1"}
+            (config / "settings.json").write_text(json.dumps(user_settings))
             args = ["--model", "claude-sonnet-4-5", "--tools", "Bash", "--allowedTools", "Bash(echo PROXY_TOOL_CHECK)",
                     "--settings", json.dumps(existing_hook(supplied_marker)),
                     "--setting-sources", "user", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
                     "--no-session-persistence", "--output-format", "json", "-p",
                     "Run echo PROXY_TOOL_CHECK exactly once, then reply VERIFIED."]
             with patch.dict(os.environ, env), patch.object(stack, "CAVE_PORT", server.server_port):
+                with stack.routed_claude_arguments(["auth", "status"]) as auth_args:
+                    auth = subprocess.run([executable, *auth_args], env=env, cwd=folder, capture_output=True,
+                                          text=True, encoding="utf-8", timeout=30)
+                assert auth.returncode == 0 and json.loads(auth.stdout)["loggedIn"], "Local proxy auth was not recognized"
                 with stack.routed_claude_arguments(args) as routed:
                     process = subprocess.run([executable, *routed], env=env, cwd=folder, capture_output=True,
                                              text=True, encoding="utf-8", timeout=120)

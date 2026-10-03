@@ -533,6 +533,13 @@ def ensure_running():
     raise RuntimeError(f"Stack did not start; inspect {directory / 'stack.log'}")
 
 
+def claude_route_env():
+    """Identify our account-authenticated local endpoint during CLI bootstrap too."""
+    return {"ANTHROPIC_BASE_URL": f"http://127.0.0.1:{CAVE_PORT}/w/claude",
+            "ANTHROPIC_AUTH_TOKEN": "unused",
+            "_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL": "0"}
+
+
 def launch_env():
     directory = state_dir()
     config = directory / "caveman.yaml"
@@ -543,9 +550,9 @@ def launch_env():
             atomic_write(config, content)
     allowlist = os.environ.get("CAVE_SSRF_ALLOWLIST", "").strip(", ")
     allowlist = ",".join(filter(None, [allowlist, f"127.0.0.1:{PROXY_PORT}"]))
-    env = {**os.environ, "CAVEMAN_CONFIG": str(config), "CAVE_GATEWAY_URL": f"http://127.0.0.1:{CAVE_PORT}",
+    env = {**os.environ, **claude_route_env(), "CAVEMAN_CONFIG": str(config), "CAVE_GATEWAY_URL": f"http://127.0.0.1:{CAVE_PORT}",
             "CAVE_SSRF_ALLOWLIST": allowlist,
-            "CAVEMAN_LISTEN": f"127.0.0.1:{CAVE_PORT}", "ANTHROPIC_AUTH_TOKEN": "unused",
+            "CAVEMAN_LISTEN": f"127.0.0.1:{CAVE_PORT}",
             "ANTHROPIC_MODEL": os.environ.get("ANTHROPIC_MODEL", "kiro:claude-sonnet-4-5"),
             "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"}
     # Alias routing belongs to the main proxy and its session affinity. Explicit
@@ -611,9 +618,7 @@ def routed_claude_arguments(arguments):
         index += 1
     if not isinstance(settings, dict) or not isinstance(settings.get("env", {}), dict):
         raise ValueError("Claude settings and their env field must be JSON objects")
-    settings["env"] = {**settings.get("env", {}),
-                       "ANTHROPIC_BASE_URL": f"http://127.0.0.1:{CAVE_PORT}/w/claude",
-                       "ANTHROPIC_AUTH_TOKEN": "unused"}
+    settings["env"] = {**settings.get("env", {}), **claude_route_env()}
     # Claude owns the transcript, task loop, permissions and cancellation. Its
     # native prompt hook evaluates evidence and returns missing work to that loop.
     # Settings scopes merge hook arrays; retain hooks supplied via --settings too.
