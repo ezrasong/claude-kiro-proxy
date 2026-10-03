@@ -222,6 +222,41 @@ From another directory you can invoke `scripts/stack.py run -- ...` by its full
 path to avoid depending on shell activation. Claude Code's "API Usage Billing"
 banner describes its API transport; it is not a request to log into Claude.
 
+## Slow Opus coding turns
+
+Long histories can make Kiro tool turns slow even when the HTTP response headers
+arrive quickly. The monitor's completed request latency includes the streamed
+generation; the structured log's `request_completed.ms` measures only the wait
+for upstream headers. Use the monitor when comparing response times.
+
+In the existing Claude session, `/compact` asks Claude to summarize the history
+and retain task context. On Claude Code versions supporting it, `/autocompact 100k`
+sets a smaller window for future native automatic summaries. This is a context
+size tradeoff, not a model change: Opus stays selected, but detailed old tool
+output is replaced by Claude's summary. `/autocompact auto` restores its native
+window policy. Explicit environment overrides and disabled automatic compaction
+still follow Claude Code's own precedence. The launcher does not force a window
+or truncate messages in the proxy.
+
+For a per-launch window instead of a saved Claude setting:
+
+```powershell
+caveman claude --continue --model kiro:claude-opus-5-5 --settings '{"autoCompactWindow":100000}'
+```
+
+Kiro's buffered endpoint returns headers only after generation finishes. The
+adapter allows up to five minutes for headers and up to five minutes of upstream
+read inactivity. Its former one-minute header cutoff could cause a healthy long
+generation to fail and be repeated by the client. These limits remain bounded;
+the adapter does not retry or switch accounts. This fix avoids premature retries,
+but does not accelerate Kiro's model generation itself.
+
+An Opus 5.5 diagnostic replay with roughly 130K input tokens took 120 seconds
+through Caveman and the main proxy, and 261 seconds directly through the selected
+gateway. A short-answer replay of the long history took 5.9 and 6.8 seconds,
+respectively. These individual samples show that bypassing the stack did not
+remove the delay in that comparison; they are not a throughput guarantee.
+
 ## Services and troubleshooting
 
 ```powershell
@@ -230,6 +265,13 @@ python scripts/stack.py serve   # foreground; Ctrl+C stops owned processes
 python scripts/stack.py stop    # stop the supervised main proxy and gateways
 python scripts/stack.py monitor # original dashboard; starts the stack if needed
 ```
+
+To install a changed Windows proxy binary, finish or exit the Claude session,
+close the dashboard window, stop the stack, and run `python scripts/stack.py setup`
+after the supervisor has stopped. Windows cannot replace an executable still in
+use. Relaunch with `caveman claude --continue --model kiro:claude-opus-5-5` from the
+same project directory to resume. Building source alone does not update a running
+service.
 
 State lives in `~/.claude-kiro-proxy`, outside the checkout. Set `CCP_KIRO_HOME`
 before importing accounts to use another dedicated directory. The controller

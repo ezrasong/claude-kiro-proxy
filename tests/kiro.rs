@@ -133,6 +133,79 @@ async fn value(response: Response) -> Value {
 }
 
 #[tokio::test]
+async fn slow_gateway_headers_do_not_restart_generation_but_remain_bounded() {
+    for (stream, expire) in [(false, false), (true, false), (false, true)] {
+        let received = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let router = Router::new().route("/v1/messages", post({
+            let received = received.clone();
+            let release = release.clone();
+            move |Json(body): Json<Value>| {
+                let received = received.clone();
+                let release = release.clone();
+                async move {
+                    received.notify_one();
+                    release.notified().await;
+                    if body["stream"] == true {
+                        Response::builder()
+                            .header("content-type", "text/event-stream")
+                            .body(Body::from("event: message_start\ndata: {\"type\":\"message_start\"}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"))
+                            .unwrap()
+                    } else {
+                        Json(json!({"type":"message","content":[{"type":"text","text":"done"}]})).into_response()
+                    }
+                }
+            }
+        }));
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("accounts.json");
+        std::fs::write(
+            &file,
+            json!({"active":"a","accounts":{"a":{"baseUrl":url,"apiKey":"local-key"}}}).to_string(),
+        )
+        .unwrap();
+        let provider = KiroProvider::with_accounts_file(file);
+        let generation =
+            tokio::spawn(async move { provider.handle_messages(request(stream), ctx()).await });
+        received.notified().await;
+        // Advance only after the request reaches the gateway, avoiding real
+        // network I/O under an automatically advancing paused clock.
+        tokio::time::pause();
+        tokio::time::advance(std::time::Duration::from_secs(if expire {
+            301
+        } else {
+            75
+        }))
+        .await;
+        tokio::task::yield_now().await;
+        if !expire {
+            assert!(
+                !generation.is_finished(),
+                "a slow successful generation was cut off"
+            );
+        }
+        tokio::time::resume();
+        release.notify_one();
+        let response = generation.await.unwrap();
+        if expire {
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        } else {
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            assert!(String::from_utf8_lossy(&bytes).contains(if stream {
+                "message_stop"
+            } else {
+                "done"
+            }));
+        }
+        server.abort();
+    }
+}
+
+#[tokio::test]
 async fn account_swap_preserves_active_stream_and_native_payload_and_count_tokens() {
     let (url_a, a, task_a) = gateway("account-a", StatusCode::OK).await;
     let (url_b, b, task_b) = gateway("account-b", StatusCode::OK).await;

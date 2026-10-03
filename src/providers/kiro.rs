@@ -21,6 +21,10 @@ use crate::{
     },
 };
 
+// The gateway waits for Kiro before sending headers. Buffered responses wait
+// for the entire generation; cutting them off at 60s starts needless retries.
+const GATEWAY_TIMEOUT: Duration = Duration::from_secs(300);
+
 #[derive(Deserialize)]
 struct Accounts {
     active: Option<String>,
@@ -65,7 +69,7 @@ impl KiroProvider {
                 .no_proxy()
                 .redirect(reqwest::redirect::Policy::none())
                 .connect_timeout(Duration::from_secs(10))
-                .read_timeout(Duration::from_secs(300))
+                .read_timeout(GATEWAY_TIMEOUT)
                 .build()
                 .expect("local Kiro HTTP client"),
         }
@@ -121,7 +125,7 @@ impl KiroProvider {
             );
         }
         let response = tokio::time::timeout(
-            Duration::from_secs(60),
+            GATEWAY_TIMEOUT,
             self.client
                 .post(format!(
                     "{}{endpoint}",
