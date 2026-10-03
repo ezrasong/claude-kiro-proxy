@@ -399,18 +399,30 @@ class StackTests(unittest.TestCase):
         (gateway / "sample.txt").write_text("original\n")
         patches = self.root / "patches"
         patches.mkdir()
-        (patches / "kiro-refusals.patch").write_text("diff --git a/sample.txt b/sample.txt\n--- a/sample.txt\n+++ b/sample.txt\n@@ -1 +1 @@\n-original\n+fixed\n")
+        (patches / "kiro-gateway.patch").write_text("diff --git a/sample.txt b/sample.txt\n--- a/sample.txt\n+++ b/sample.txt\n@@ -1 +1 @@\n-original\n+fixed\n" + "diff --git a/stream.txt b/stream.txt\n--- a/stream.txt\n+++ b/stream.txt\n@@ -1 +1 @@\n-silent\n+keepalive\n")
         (gateway / "stream.txt").write_text("silent\n")
-        (patches / "kiro-streaming.patch").write_text("diff --git a/stream.txt b/stream.txt\n--- a/stream.txt\n+++ b/stream.txt\n@@ -1 +1 @@\n-silent\n+keepalive\n")
+        (patches / "kiro-native-streaming.patch").write_text("diff --git a/stream.txt b/stream.txt\n--- a/stream.txt\n+++ b/stream.txt\n@@ -1 +1 @@\n-silent\n+keepalive\n")
         with patch.object(stack, "ROOT", self.root), patch.object(stack, "GATEWAY", gateway):
             stack.apply_gateway_patch()
             stack.apply_gateway_patch()
             self.assertEqual((gateway / "sample.txt").read_text(), "fixed\n")
             self.assertEqual((gateway / "stream.txt").read_text(), "keepalive\n")
+            # A previous installation already has the refusal fix. Migrate
+            # the remaining change without resetting any unrelated files.
+            (gateway / "stream.txt").write_text("silent\n")
+            (gateway / "local.txt").write_text("keep user changes\n")
+            stack.apply_gateway_patch()
+            stack.apply_gateway_patch()
+            self.assertEqual((gateway / "stream.txt").read_text(), "keepalive\n")
+            self.assertEqual((gateway / "local.txt").read_text(), "keep user changes\n")
             (gateway / "sample.txt").write_text("user edit\n")
             with self.assertRaisesRegex(RuntimeError, "resolve local gateway edits"):
                 stack.apply_gateway_patch()
             self.assertEqual((gateway / "sample.txt").read_text(), "user edit\n")
+            (gateway / "stream.txt").write_text("silent\n")
+            with self.assertRaisesRegex(RuntimeError, "resolve local gateway edits"):
+                stack.apply_gateway_patch()
+            self.assertEqual((gateway / "stream.txt").read_text(), "silent\n")
 
 
 if __name__ == "__main__":

@@ -1,2 +1,2 @@
 # Unified patches must preserve the upstream's context whitespace.
-patches/*.patch -whitespace
+patches/*.patch text eol=lf -whitespace

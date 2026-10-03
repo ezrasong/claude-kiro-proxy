@@ -333,18 +333,32 @@ def proxy_binary():
 
 
 def apply_gateway_patch():
-    """Apply pinned gateway fixes once, preserving unrelated gateway changes."""
+    """Install the cumulative patch, or migrate the previously installed fixes.
+
+    A cumulative patch avoids overlapping reverse checks between fixes. The
+    native-streaming patch upgrades the prior refusal/keepalive installation.
+    Both checks preserve unrelated source edits and reject conflicts.
+    """
     with locked("gateway-patch.lock"):
         command = ["git", "apply", "--whitespace=nowarn"]
-        for filename in ("kiro-refusals.patch", "kiro-streaming.patch"):
+        patch_file = ROOT / "patches" / "kiro-gateway.patch"
+        if subprocess.run([*command, "--reverse", "--check", str(patch_file)], cwd=GATEWAY,
+                          capture_output=True).returncode == 0:
+            return
+        for filename in ("kiro-gateway.patch", "kiro-native-streaming.patch"):
             patch_file = ROOT / "patches" / filename
-            if subprocess.run([*command, "--reverse", "--check", str(patch_file)], cwd=GATEWAY,
-                              capture_output=True).returncode == 0:
-                continue
             if subprocess.run([*command, "--check", str(patch_file)], cwd=GATEWAY,
-                              capture_output=True).returncode != 0:
-                raise RuntimeError(f"Kiro gateway source does not match {filename}; resolve local gateway edits before starting.")
-            subprocess.run([*command, str(patch_file)], cwd=GATEWAY, check=True)
+                              capture_output=True).returncode == 0:
+                subprocess.run([*command, str(patch_file)], cwd=GATEWAY, check=True)
+                full_patch = ROOT / "patches" / "kiro-gateway.patch"
+                if subprocess.run([*command, "--reverse", "--check", str(full_patch)], cwd=GATEWAY,
+                                  capture_output=True).returncode == 0:
+                    return
+                # An unrelated edit may conflict with an older fix outside the
+                # upgrade's context. Roll back this attempt before reporting it.
+                subprocess.run([*command, "--reverse", str(patch_file)], cwd=GATEWAY, check=True)
+                break
+        raise RuntimeError("Kiro gateway source does not match the pinned fixes; resolve local gateway edits before starting.")
 
 
 def gateway_env(account, folder):

@@ -1,0 +1,588 @@
+diff --git a/kiro/parsers.py b/kiro/parsers.py
+index f680c42..ce55699 100644
+--- a/kiro/parsers.py
++++ b/kiro/parsers.py
+@@ -29,6 +29,8 @@ Contains classes and functions for:
+ 
+ import json
+ import re
++import struct
++import zlib
+ from typing import Any, Dict, List, Optional
+ 
+ from loguru import logger
+@@ -256,6 +258,8 @@ class AwsEventStreamParser:
+         self.last_content: Optional[str] = None  # For deduplicating repeating content
+         self.current_tool_call: Optional[Dict[str, Any]] = None
+         self.tool_calls: List[Dict[str, Any]] = []
++        self._framed: Optional[bool] = None
++        self._frame_buffer = bytearray()
+     
+     def feed(self, chunk: bytes) -> List[Dict[str, Any]]:
+         """
+@@ -267,6 +271,12 @@ class AwsEventStreamParser:
+         Returns:
+             List of events in {"type": str, "data": Any} format
+         """
++        if not chunk:
++            return []
++        if self._framed is None:
++            self._framed = chunk[0] == 0
++        if self._framed:
++            return self._feed_frames(chunk)
+         try:
+             self.buffer += chunk.decode('utf-8', errors='ignore')
+         except Exception:
+@@ -584,3 +594,120 @@ class AwsEventStreamParser:
+         self.last_content = None
+         self.current_tool_call = None
+         self.tool_calls = []
++        self._framed = None
++        self._frame_buffer.clear()
++
++    def _feed_frames(self, chunk: bytes) -> List[Dict[str, Any]]:
++        """Decode complete AWS frames without losing split UTF-8 or native reasoning.
++
++        Args:
++            chunk: Bytes from a binary AWS event stream.
++
++        Returns:
++            Parsed events; incomplete frames remain buffered.
++
++        Raises:
++            ValueError: Invalid length, checksum, headers, or JSON payload.
++        """
++        self._frame_buffer.extend(chunk)
++        events: List[Dict[str, Any]] = []
++        while len(self._frame_buffer) >= 12:
++            length, header_length, prelude_crc = struct.unpack('>III', self._frame_buffer[:12])
++            if length < 16 or length >= 16 * 1024 * 1024 or header_length > length - 16:
++                raise ValueError('Invalid AWS event-stream frame length')
++            if zlib.crc32(self._frame_buffer[:8]) != prelude_crc:
++                raise ValueError('Invalid AWS event-stream prelude checksum')
++            if len(self._frame_buffer) < length:
++                break
++            frame = bytes(self._frame_buffer[:length])
++            del self._frame_buffer[:length]
++            if zlib.crc32(frame[:-4]) != int.from_bytes(frame[-4:], 'big'):
++                raise ValueError('Invalid AWS event-stream message checksum')
++            event_type = self._frame_event_type(frame[12:12 + header_length])
++            try:
++                data = json.loads(frame[12 + header_length:-4])
++            except (UnicodeError, json.JSONDecodeError) as exc:
++                raise ValueError('Invalid AWS event-stream JSON payload') from exc
++            if not isinstance(data, dict):
++                raise ValueError('Invalid AWS event-stream payload type')
++            if event_type == 'reasoningContentEvent':
++                text = data.get('text')
++                if isinstance(text, str) and text:
++                    events.append({'type': 'thinking', 'data': text})
++                signature = data.get('signature')
++                if isinstance(signature, str) and signature:
++                    events.append({'type': 'thinking_signature', 'data': signature})
++                continue
++            kinds = {
++                'assistantResponseEvent': 'content',
++                'contextUsageEvent': 'context_usage',
++                'meteringEvent': 'usage',
++                'metadataEvent': 'metadata',
++            }
++            kind = kinds.get(event_type)
++            if event_type == 'toolUseEvent':
++                current_id = self.current_tool_call['id'] if self.current_tool_call else None
++                if 'name' in data and (self.current_tool_call is None or data.get('toolUseId') not in (None, current_id)):
++                    self._process_tool_start_event(data)
++                else:
++                    if 'input' in data:
++                        self._process_tool_input_event(data)
++                    if data.get('stop'):
++                        self._process_tool_stop_event(data)
++                continue
++            if kind:
++                event = self._process_event(data, kind)
++                if event:
++                    events.append(event)
++        return events
++
++    @staticmethod
++    def _frame_event_type(headers: bytes) -> Optional[str]:
++        """Read the AWS event-type string while validating all header boundaries.
++
++        Args:
++            headers: The header section of a complete AWS frame.
++
++        Returns:
++            Event type, or None when absent.
++
++        Raises:
++            ValueError: A header type, length, or string is malformed.
++        """
++        offset = 0
++        event_type = None
++        fixed_sizes = {0: 0, 1: 0, 2: 1, 3: 2, 4: 4, 5: 8, 8: 8, 9: 16}
++        while offset < len(headers):
++            name_length = headers[offset]
++            offset += 1
++            if offset + name_length + 1 > len(headers):
++                raise ValueError('Invalid AWS event-stream header')
++            name = headers[offset:offset + name_length]
++            offset += name_length
++            value_type = headers[offset]
++            offset += 1
++            if value_type in (6, 7):
++                if offset + 2 > len(headers):
++                    raise ValueError('Invalid AWS event-stream header')
++                size = int.from_bytes(headers[offset:offset + 2], 'big')
++                offset += 2
++            elif value_type in fixed_sizes:
++                size = fixed_sizes[value_type]
++            else:
++                raise ValueError('Invalid AWS event-stream header type')
++            if offset + size > len(headers):
++                raise ValueError('Invalid AWS event-stream header')
++            if name == b':event-type':
++                if value_type != 7:
++                    raise ValueError('Invalid AWS event-stream event type')
++                try:
++                    event_type = headers[offset:offset + size].decode('utf-8')
++                except UnicodeError as exc:
++                    raise ValueError('Invalid AWS event-stream event type') from exc
++            offset += size
++        return event_type
++
++    def finish(self) -> None:
++        """Reject truncated binary frames instead of reporting a successful response."""
++        if self._framed and self._frame_buffer:
++            raise ValueError('Incomplete AWS event-stream frame')
+diff --git a/kiro/streaming_anthropic.py b/kiro/streaming_anthropic.py
+index ca06933..46c851a 100644
+--- a/kiro/streaming_anthropic.py
++++ b/kiro/streaming_anthropic.py
+@@ -49,7 +49,7 @@ from kiro.streaming_core import (
+     calculate_tokens_from_context_usage,
+     stream_with_first_token_retry,
+ )
+-from kiro.tokenizer import count_tokens, estimate_request_tokens
++from kiro.tokenizer import count_tokens, count_output_tokens, estimate_request_tokens
+ from kiro.parsers import parse_bracket_tool_calls, deduplicate_tool_calls
+ from kiro.config import FIRST_TOKEN_TIMEOUT, FIRST_TOKEN_MAX_RETRIES, FAKE_REASONING_HANDLING
+ 
+@@ -277,7 +277,7 @@ async def stream_kiro_to_anthropic(
+                             "content_block": {
+                                 "type": "thinking",
+                                 "thinking": "",
+-                                "signature": thinking_signature
++                                "signature": "" if event.native_thinking else thinking_signature
+                             }
+                         })
+                         thinking_block_started = True
+@@ -522,6 +522,12 @@ async def stream_kiro_to_anthropic(
+                 })
+                 current_block_index += 1
+             
++            elif event.type == "thinking_signature" and event.thinking_signature:
++                if thinking_block_started and thinking_block_index is not None:
++                    yield format_sse_event("content_block_delta", {
++                        "type": "content_block_delta", "index": thinking_block_index,
++                        "delta": {"type": "signature_delta", "signature": event.thinking_signature}
++                    })
+             elif event.type == "context_usage" and event.context_usage_percentage is not None:
+                 context_usage_percentage = event.context_usage_percentage
+             elif event.type == "usage" and event.usage:
+@@ -629,7 +635,7 @@ async def stream_kiro_to_anthropic(
+             raise RuntimeError("Kiro ended the response without content or tools")
+ 
+         # Calculate output tokens
+-        output_tokens = count_tokens(full_content + full_thinking_content)
++        output_tokens = count_output_tokens(full_content, full_thinking_content, tool_blocks)
+         
+         # Calculate total tokens from context usage if available
+         if context_usage_percentage is not None:
+@@ -780,7 +786,7 @@ async def collect_anthropic_response(
+         content_blocks.append({
+             "type": "thinking",
+             "thinking": result.thinking_content,
+-            "signature": generate_thinking_signature()
++            "signature": result.thinking_signature if result.native_thinking else generate_thinking_signature()
+         })
+     
+     # Add text block if there's content
+@@ -815,7 +821,7 @@ async def collect_anthropic_response(
+         })
+     
+     # Calculate output tokens
+-    output_tokens = count_tokens(result.content + result.thinking_content)
++    output_tokens = count_output_tokens(result.content, result.thinking_content, result.tool_calls)
+     
+     # Calculate from context usage if available
+     if result.context_usage_percentage is not None:
+diff --git a/kiro/streaming_core.py b/kiro/streaming_core.py
+index 33d5603..ab78ec4 100644
+--- a/kiro/streaming_core.py
++++ b/kiro/streaming_core.py
+@@ -85,6 +85,8 @@ class KiroEvent:
+     context_usage_percentage: Optional[float] = None
+     is_first_thinking_chunk: bool = False
+     is_last_thinking_chunk: bool = False
++    native_thinking: bool = False
++    thinking_signature: Optional[str] = None
+ 
+ 
+ @dataclass
+@@ -106,6 +108,8 @@ class StreamResult:
+     usage: Optional[Dict[str, Any]] = None
+     context_usage_percentage: Optional[float] = None
+     refused: bool = False
++    thinking_signature: str = ''
++    native_thinking: bool = False
+ 
+ 
+ class FirstTokenTimeoutError(Exception):
+@@ -189,6 +193,7 @@ async def parse_kiro_stream(
+                 if event.type == "refusal":
+                     return
+         
++        parser.finish()
+         # Finalize thinking parser and yield any remaining content
+         if thinking_parser:
+             final_result = thinking_parser.finalize()
+@@ -289,6 +294,11 @@ async def _process_chunk(
+         
+         elif event["type"] == "context_usage":
+             yield KiroEvent(type="context_usage", context_usage_percentage=event["data"])
++        elif event["type"] == "thinking":
++            # Native reasoning is already separated by the AWS event type.
++            yield KiroEvent(type="thinking", thinking_content=event["data"], native_thinking=True)
++        elif event["type"] == "thinking_signature":
++            yield KiroEvent(type="thinking_signature", thinking_signature=event["data"])
+ 
+ 
+ # ==================================================================================================
+@@ -328,11 +338,13 @@ async def collect_stream_to_result(
+             full_content_for_bracket_tools += event.content
+         elif event.type == "thinking" and event.thinking_content:
+             result.thinking_content += event.thinking_content
+-            full_content_for_bracket_tools += event.thinking_content
++            result.native_thinking = result.native_thinking or event.native_thinking
+         elif event.type == "tool_use" and event.tool_use:
+             result.tool_calls.append(event.tool_use)
+         elif event.type == "usage" and event.usage:
+             result.usage = event.usage
++        elif event.type == "thinking_signature" and event.thinking_signature:
++            result.thinking_signature += event.thinking_signature
+         elif event.type == "context_usage" and event.context_usage_percentage is not None:
+             result.context_usage_percentage = event.context_usage_percentage
+     
+diff --git a/kiro/streaming_openai.py b/kiro/streaming_openai.py
+index c0b8ee8..188549e 100644
+--- a/kiro/streaming_openai.py
++++ b/kiro/streaming_openai.py
+@@ -43,7 +43,7 @@ from kiro.config import (
+     FIRST_TOKEN_MAX_RETRIES,
+     FAKE_REASONING_HANDLING,
+ )
+-from kiro.tokenizer import count_tokens, count_message_tokens, count_tools_tokens
++from kiro.tokenizer import count_tokens, count_output_tokens, count_message_tokens, count_tools_tokens
+ 
+ # Import from streaming_core - reuse shared parsing logic
+ from kiro.streaming_core import (
+@@ -306,7 +306,7 @@ async def stream_kiro_to_openai_internal(
+             finish_reason = "stop"
+         
+         # Count completion_tokens (output) using tiktoken
+-        completion_tokens = count_tokens(full_content + full_thinking_content)
++        completion_tokens = count_output_tokens(full_content, full_thinking_content, all_tool_calls)
+         
+         # Calculate total_tokens based on context_usage_percentage from Kiro API
+         # context_usage shows TOTAL percentage of context usage (input + output)
+diff --git a/kiro/tokenizer.py b/kiro/tokenizer.py
+index d25a752..ab6f470 100644
+--- a/kiro/tokenizer.py
++++ b/kiro/tokenizer.py
+@@ -39,6 +39,28 @@ from loguru import logger
+ # Lazy loading of tiktoken to speed up import
+ _encoding = None
+ 
++
++def count_output_tokens(content: str, thinking: str, tool_calls: List[Dict[str, Any]]) -> int:
++    """Estimate generated tokens including tool names and JSON arguments.
++
++    Args:
++        content: Generated response text.
++        thinking: Generated reasoning text.
++        tool_calls: Completed, deduplicated calls in the shared parser format.
++
++    Returns:
++        Approximate output tokens, using the same tokenizer as ordinary text.
++    """
++    tools = []
++    for call in tool_calls:
++        function = call.get('function') or {}
++        name = function.get('name') or call.get('name') or ''
++        arguments = function.get('arguments', call.get('input', {}))
++        if not isinstance(arguments, str):
++            arguments = json.dumps(arguments, ensure_ascii=False)
++        tools.append(name + arguments)
++    return count_tokens(content + thinking + ''.join(tools))
++
+ # Correction coefficient for Claude models
+ # Claude tokenizes text approximately 15% more than GPT-4 (cl100k_base)
+ # This is an empirical value based on comparison with context_usage from API
+diff --git a/tests/conftest.py b/tests/conftest.py
+index c9a9f66..a5593d9 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -13,7 +13,7 @@ import pytest
+ import time
+ import struct
+ import zlib
+-from typing import AsyncGenerator, Dict, Any, List
++from typing import AsyncGenerator, Callable, Dict, Any, List
+ from unittest.mock import AsyncMock, MagicMock, Mock, patch
+ from datetime import datetime, timezone
+ 
+@@ -223,24 +223,14 @@ def mock_kiro_models_response():
+ # =============================================================================
+ 
+ @pytest.fixture
+-def refused_kiro_response() -> httpx.Response:
++def refused_kiro_response(aws_frame: Callable) -> httpx.Response:
+     """Build fragmented AWS frames with a pending tool and a terminal refusal."""
+-    def frame(event: str, value: Dict[str, Any]) -> bytes:
+-        """Encode an AWS event frame, including header and message CRCs."""
+-        key = b':event-type'
+-        name = event.encode()
+-        headers = bytes([len(key)]) + key + b'\x07' + len(name).to_bytes(2, 'big') + name
+-        payload = json.dumps(value, separators=(',', ':')).encode()
+-        prelude = struct.pack('>II', 16 + len(headers) + len(payload), len(headers))
+-        message = prelude + struct.pack('>I', zlib.crc32(prelude)) + headers + payload
+-        return message + struct.pack('>I', zlib.crc32(message))
+-
+-    raw = frame('toolUseEvent', {'name': 'never_run', 'toolUseId': 'pending', 'input': '{}', 'stop': True})
+-    raw += frame('metadataEvent', {
++    raw = aws_frame('toolUseEvent', {'name': 'never_run', 'toolUseId': 'pending', 'input': '{}', 'stop': True})
++    raw += aws_frame('metadataEvent', {
+         'stopDetails': {'refusal': {'category': 'REASONING_EXTRACTION', 'explanation': 'do-not-forward-private-detail'}},
+         'stopReason': 'CONTENT_FILTERED',
+     })
+-    raw += frame('assistantResponseEvent', {'content': 'DO_NOT_SHOW_AFTER_REFUSAL'})
++    raw += aws_frame('assistantResponseEvent', {'content': 'DO_NOT_SHOW_AFTER_REFUSAL'})
+ 
+     class Stream(httpx.AsyncByteStream):
+         """Deliver frames across arbitrary byte boundaries without a network."""
+@@ -1882,3 +1872,17 @@ def temp_account_credentials_files(tmp_path):
+     files["account3"] = str(account3)
+     
+     return files
++# Native event streams are binary AWS frames, not unframed JSON snippets.
++@pytest.fixture
++def aws_frame() -> Callable:
++    """Build CRC-protected AWS frames with explicit event headers for stream tests."""
++    def encode(kind: str, payload: Dict[str, Any]) -> bytes:
++        def header(name: str, value: str) -> bytes:
++            name, value = name.encode(), value.encode()
++            return bytes([len(name)]) + name + b'\x07' + struct.pack('>H', len(value)) + value
++        headers = header(':message-type', 'event') + header(':event-type', kind)
++        body = json.dumps(payload, ensure_ascii=False, separators=(',', ':')).encode()
++        prelude = struct.pack('>II', 16 + len(headers) + len(body), len(headers))
++        frame = prelude + struct.pack('>I', zlib.crc32(prelude)) + headers + body
++        return frame + struct.pack('>I', zlib.crc32(frame))
++    return encode
+diff --git a/tests/unit/test_parsers.py b/tests/unit/test_parsers.py
+index bbe32f0..91f1f36 100644
+--- a/tests/unit/test_parsers.py
++++ b/tests/unit/test_parsers.py
+@@ -7,6 +7,7 @@ Tests the parsing logic for AWS SSE stream from Kiro API.
+ 
+ import pytest
+ import json
++from typing import Callable
+ 
+ from kiro.parsers import (
+     AwsEventStreamParser,
+@@ -1387,3 +1388,62 @@ class TestTruncationRecoveryIntegration:
+         
+         print("Checking: Third tool call NOT marked as truncated...")
+         assert aws_event_parser.tool_calls[2].get("_truncation_detected") is not True
++@pytest.mark.parametrize('split', range(1, 25))
++def test_native_reasoning_binary_frames_preserve_unicode_and_signatures(aws_frame: Callable, split: int) -> None:
++    """Every byte boundary, including UTF-8 code points and headers, is safe."""
++    raw = aws_frame('reasoningContentEvent', {'text': 'Thinking \u03bb\U0001f642'})
++    raw += aws_frame('reasoningContentEvent', {'signature': 'signed-part'})
++    raw += aws_frame('assistantResponseEvent', {'content': 'Answer'})
++    parser = AwsEventStreamParser()
++    events = []
++    for start in range(0, len(raw), split):
++        events.extend(parser.feed(raw[start:start + split]))
++    parser.finish()
++    assert events == [{'type': 'thinking', 'data': 'Thinking \u03bb\U0001f642'},
++                      {'type': 'thinking_signature', 'data': 'signed-part'},
++                      {'type': 'content', 'data': 'Answer'}]
++    assert not parser._frame_buffer
++    parser.reset()
++    assert parser.feed(b'{"content":"legacy"}')[0]['data'] == 'legacy'
++
++
++def test_native_tool_fragments_with_repeated_name_and_id_are_one_call(aws_frame: Callable) -> None:
++    """Real Kiro repeats tool identity on fragments; key order cannot split the call."""
++    parser = AwsEventStreamParser()
++    raw = aws_frame('toolUseEvent', {'name': 'Write', 'toolUseId': 'call', 'input': {}})
++    for piece in ['{"content":', '"Hello \u03bb"', '}']:
++        raw += aws_frame('toolUseEvent', {'name': 'Write', 'toolUseId': 'call', 'input': piece})
++    raw += aws_frame('toolUseEvent', {'name': 'Write', 'toolUseId': 'call', 'stop': True})
++    parser.feed(raw)
++    calls = parser.get_tool_calls()
++    assert len(calls) == 1
++    assert json.loads(calls[0]['function']['arguments']) == {'content': 'Hello \u03bb'}
++
++
++def test_unknown_binary_events_cannot_inject_nested_content(aws_frame: Callable) -> None:
++    """Only the AWS event header assigns meaning to a payload."""
++    assert AwsEventStreamParser().feed(aws_frame('unknownEvent', {'text': 'ignore', 'nested': {'content': 'ignore'}})) == []
++
++
++@pytest.mark.parametrize('index', [0, 8, -1])
++def test_corrupt_binary_frame_fails_closed(aws_frame: Callable, index: int) -> None:
++    raw = bytearray(aws_frame('reasoningContentEvent', {'text': 'think'}))
++    raw[index] ^= 1
++    # Keep the leading zero for framed mode, but corrupt the length itself.
++    if index == 0:
++        raw[0] = 0; raw[3] ^= 1
++    with pytest.raises(ValueError):
++        AwsEventStreamParser().feed(bytes(raw))
++
++
++def test_truncated_binary_frame_cannot_finish_successfully(aws_frame: Callable) -> None:
++    parser = AwsEventStreamParser()
++    parser.feed(aws_frame('assistantResponseEvent', {'content': 'missing crc'})[:-1])
++    with pytest.raises(ValueError, match='Incomplete'):
++        parser.finish()
++
++
++@pytest.mark.parametrize('headers', [b'\x05abc', b'\x01x\x07\x00', b'\x01x\x07\x00\x05a', b'\x01x\xff'])
++def test_invalid_binary_header_bounds_are_rejected(headers: bytes) -> None:
++    with pytest.raises(ValueError, match='header'):
++        AwsEventStreamParser._frame_event_type(headers)
+diff --git a/tests/unit/test_streaming_anthropic.py b/tests/unit/test_streaming_anthropic.py
+index 270dbeb..c3eba39 100644
+--- a/tests/unit/test_streaming_anthropic.py
++++ b/tests/unit/test_streaming_anthropic.py
+@@ -16,6 +16,7 @@ import json
+ import httpx
+ import uuid
+ from unittest.mock import AsyncMock, MagicMock, patch
++from typing import Callable
+ 
+ from kiro.streaming_anthropic import (
+     generate_message_id,
+@@ -1752,3 +1753,30 @@ async def test_empty_kiro_response_never_reports_task_completion(
+     else:
+         with pytest.raises(RuntimeError, match='without content or tools'):
+             await collect_anthropic_response(response, 'claude-opus-5-5', mock_model_cache, mock_auth_manager)
++@pytest.mark.asyncio
++@pytest.mark.parametrize('stream', [True, False])
++@pytest.mark.parametrize('thinking', [True, False])
++async def test_native_reasoning_signatures_and_tool_output_usage(aws_frame: Callable, stream: bool, thinking: bool, mock_model_cache: MagicMock, mock_auth_manager: MagicMock) -> None:
++    """Streaming and buffered APIs preserve native signatures and count tool JSON."""
++    raw = b''
++    if thinking:
++        raw += aws_frame('reasoningContentEvent', {'text': 'Working on the request'})
++        raw += aws_frame('reasoningContentEvent', {'signature': 'sig-part-one'})
++        raw += aws_frame('reasoningContentEvent', {'signature': '-part-two'})
++    raw += aws_frame('toolUseEvent', {'name': 'Write', 'toolUseId': 'call', 'input': {'content': 'x ' * 100}, 'stop': True})
++    raw += aws_frame('contextUsageEvent', {'contextUsagePercentage': 1})
++    response = httpx.Response(200, content=raw)
++    if stream:
++        chunks = [chunk async for chunk in stream_kiro_to_anthropic(response, 'claude-opus-5-5', mock_model_cache, mock_auth_manager)]
++        values = [json.loads(line[6:]) for chunk in chunks for line in chunk.splitlines() if line.startswith('data: ')]
++        signatures = [v['delta']['signature'] for v in values if v.get('delta', {}).get('type') == 'signature_delta']
++        if thinking:
++            assert ''.join(signatures) == 'sig-part-one-part-two'
++            assert any(v.get('delta', {}).get('type') == 'thinking_delta' for v in values)
++        usage = next(v['usage'] for v in values if v['type'] == 'message_delta')
++        assert values[-1]['type'] == 'message_stop'
++    else:
++        result = await collect_anthropic_response(response, 'claude-opus-5-5', mock_model_cache, mock_auth_manager)
++        if thinking: assert result['content'][0]['signature'] == 'sig-part-one-part-two'
++        usage = result['usage']
++    assert usage['output_tokens'] > 100
+diff --git a/tests/unit/test_streaming_core.py b/tests/unit/test_streaming_core.py
+index 4f20116..b38c57b 100644
+--- a/tests/unit/test_streaming_core.py
++++ b/tests/unit/test_streaming_core.py
+@@ -18,6 +18,7 @@ import asyncio
+ import httpx
+ from unittest.mock import AsyncMock, MagicMock, patch
+ from dataclasses import asdict
++from typing import AsyncGenerator, Callable
+ 
+ from kiro.streaming_core import (
+     KiroEvent,
+@@ -1852,3 +1853,31 @@ class TestStreamWithFirstTokenRetryCore:
+         assert make_request_call_count == 1
+         assert len(chunks) == 1
+         print("✓ make_request called immediately when initial_response is None")
++@pytest.mark.asyncio
++async def test_native_reasoning_arrives_before_tool_completion(aws_frame: Callable) -> None:
++    """Native thinking must reach consumers while the upstream tool is still pending."""
++    release = asyncio.Event()
++    class Stream(httpx.AsyncByteStream):
++        async def __aiter__(self) -> AsyncGenerator[bytes, None]:
++            yield aws_frame('reasoningContentEvent', {'text': 'Working'})
++            await release.wait()
++            yield aws_frame('reasoningContentEvent', {'signature': 'native-signature'})
++            yield aws_frame('toolUseEvent', {'name': 'Bash', 'toolUseId': 'call', 'input': {'command': 'synthetic'}, 'stop': True})
++    output = parse_kiro_stream(httpx.Response(200, stream=Stream()))
++    event = await asyncio.wait_for(anext(output), 1)
++    assert event.type == 'thinking' and event.native_thinking
++    assert not release.is_set()
++    release.set()
++    tail = [event async for event in output]
++    assert [event.type for event in tail] == ['thinking_signature', 'tool_use']
++
++
++@pytest.mark.asyncio
++async def test_native_reasoning_is_never_parsed_as_executable_bracket_tools(aws_frame: Callable) -> None:
++    raw = aws_frame('reasoningContentEvent', {'text': '[Called Bash with args: {"command":"never execute"}]'})
++    raw += aws_frame('reasoningContentEvent', {'signature': 'sig'})
++    raw += aws_frame('assistantResponseEvent', {'content': 'Done'})
++    result = await collect_stream_to_result(httpx.Response(200, content=raw))
++    assert result.thinking_signature == 'sig'
++    assert result.native_thinking
++    assert not result.tool_calls
+diff --git a/tests/unit/test_streaming_openai.py b/tests/unit/test_streaming_openai.py
+index 19123f1..1700ca4 100644
+--- a/tests/unit/test_streaming_openai.py
++++ b/tests/unit/test_streaming_openai.py
+@@ -16,6 +16,7 @@ import json
+ import httpx
+ import asyncio
+ from unittest.mock import AsyncMock, MagicMock, patch
++from typing import Callable
+ 
+ from kiro.streaming_openai import (
+     stream_kiro_to_openai,
+@@ -1505,3 +1506,23 @@ class TestStreamingOpenaiTruncationDetection:
+         # Should extract "length" from streaming chunks
+         assert result["choices"][0]["finish_reason"] == "length"
+         print("✓ collect_stream_response extracts finish_reason correctly")
++@pytest.mark.asyncio
++@pytest.mark.parametrize('stream', [True, False])
++async def test_native_reasoning_and_tool_usage_for_openai(aws_frame: Callable, stream: bool, mock_http_client: AsyncMock, mock_model_cache: MagicMock, mock_auth_manager: MagicMock) -> None:
++    """OpenAI supports native reasoning_content in both API modes and counts tool JSON."""
++    import httpx
++    raw = aws_frame('reasoningContentEvent', {'text': 'Working'})
++    raw += aws_frame('reasoningContentEvent', {'signature': 'opaque'})
++    raw += aws_frame('toolUseEvent', {'name': 'Write', 'toolUseId': 'call', 'input': {'content': 'x ' * 100}, 'stop': True})
++    raw += aws_frame('contextUsageEvent', {'contextUsagePercentage': 1})
++    response = httpx.Response(200, content=raw)
++    if stream:
++        chunks = [c async for c in stream_kiro_to_openai(mock_http_client, response, 'claude-opus-5-5', mock_model_cache, mock_auth_manager)]
++        values = [json.loads(line[6:]) for c in chunks for line in c.splitlines() if line.startswith('data: ') and line != 'data: [DONE]']
++        assert any(v['choices'][0]['delta'].get('reasoning_content') == 'Working' for v in values)
++        usage = next(v['usage'] for v in values if 'usage' in v)
++    else:
++        result = await collect_stream_response(mock_http_client, response, 'claude-opus-5-5', mock_model_cache, mock_auth_manager)
++        assert result['choices'][0]['message']['reasoning_content'] == 'Working'
++        usage = result['usage']
++    assert usage['completion_tokens'] > 100

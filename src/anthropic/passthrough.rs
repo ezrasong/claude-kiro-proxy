@@ -101,11 +101,6 @@ where
                 return Some(self.fail_at("protocol", "missing_message_stop"));
             }
         };
-        if self.bytes == 0
-            && let Some(monitor) = self.monitor.as_ref()
-        {
-            monitor.generation_started(&self.req_id);
-        }
         self.bytes = self.bytes.saturating_add(chunk.len() as u64);
         self.chunks = self.chunks.saturating_add(1);
 
@@ -116,6 +111,8 @@ where
         let mut input_tokens = None;
         let mut output_tokens = None;
         let mut terminal = false;
+        let mut generated_bytes = 0_u64;
+        let mut generated_chunks = 0_u64;
         for event in events {
             if terminal {
                 return Some(self.fail_at("protocol", "event_after_message_stop"));
@@ -140,6 +137,28 @@ where
                 .and_then(serde_json::Value::as_u64)
                 .or(output_tokens);
             let kind = value.get("type").and_then(serde_json::Value::as_str);
+            if kind == Some("content_block_delta") {
+                // Heartbeats, metadata, and opaque signatures are transport
+                // traffic. The displayed rate measures generated content.
+                let delta = value.get("delta");
+                let field = match delta
+                    .and_then(|delta| delta.get("type"))
+                    .and_then(serde_json::Value::as_str)
+                {
+                    Some("text_delta") => Some("text"),
+                    Some("thinking_delta") => Some("thinking"),
+                    Some("input_json_delta") => Some("partial_json"),
+                    _ => None,
+                };
+                if let Some(text) = field
+                    .and_then(|field| delta.and_then(|delta| delta.get(field)))
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|text| !text.is_empty())
+                {
+                    generated_bytes = generated_bytes.saturating_add(text.len() as u64);
+                    generated_chunks = generated_chunks.saturating_add(1);
+                }
+            }
             if event.event.as_deref() == Some("error") || kind == Some("error") {
                 return Some(self.fail_at("upstream", "error_event"));
             }
@@ -148,13 +167,17 @@ where
             }
         }
         if let Some(monitor) = self.monitor.as_ref() {
-            monitor.stream_progress(
-                &self.req_id,
-                chunk.len() as u64,
-                1,
-                input_tokens,
-                output_tokens,
-            );
+            if generated_chunks > 0 {
+                monitor.stream_progress(
+                    &self.req_id,
+                    generated_bytes,
+                    generated_chunks,
+                    input_tokens,
+                    output_tokens,
+                );
+            } else if input_tokens.is_some() || output_tokens.is_some() {
+                monitor.usage_updated(&self.req_id, input_tokens, output_tokens);
+            }
         }
         if terminal {
             if self.decoder.finish().is_err() {
@@ -342,6 +365,48 @@ mod tests {
                 .unwrap()
                 .contains("transport: upstream_stream")
         );
+    }
+
+    #[tokio::test]
+    async fn monitor_counts_generated_deltas_without_pings_or_signatures() {
+        use crate::monitor::EndpointKind;
+        let monitor = MonitorHandle::default();
+        monitor.request_started("native-progress", None, None, EndpointKind::Messages);
+        let chunks = [
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":100,\"output_tokens\":0}}}\n\n",
+            "event: ping\ndata: {\"type\":\"ping\"}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"Working\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"signature_delta\",\"signature\":\"opaque-signature\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":12}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        ];
+        let upstream = futures_util::stream::iter(
+            chunks.map(|chunk| Ok::<_, std::io::Error>(Bytes::from_static(chunk.as_bytes()))),
+        );
+        let mut body = stream_body(
+            upstream,
+            "Kiro",
+            Some(monitor.clone()),
+            "native-progress".into(),
+            None,
+        );
+        for expected in &chunks[..2] {
+            let frame = body.frame().await.unwrap().unwrap().into_data().unwrap();
+            assert_eq!(frame.as_ref(), expected.as_bytes());
+            let snapshot = monitor.snapshot();
+            assert_eq!(snapshot.active[0].streamed_bytes, 0);
+            assert!(snapshot.active[0].generation_started_at.is_none());
+        }
+        let bytes = body.collect().await.unwrap().to_bytes();
+        assert_eq!(bytes.as_ref(), chunks[2..].concat().as_bytes());
+        let snapshot = monitor.snapshot();
+        let active = &snapshot.active[0];
+        assert_eq!(active.streamed_bytes, 9);
+        assert_eq!(active.stream_chunks, 2);
+        assert_eq!(active.input_tokens, Some(100));
+        assert_eq!(active.output_tokens, Some(12));
+        assert!(active.generation_started_at.is_some());
     }
 
     #[tokio::test]
