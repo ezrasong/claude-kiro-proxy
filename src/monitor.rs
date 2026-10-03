@@ -782,6 +782,15 @@ impl MonitorStore {
         output_tokens: Option<u64>,
         error: Option<String>,
     ) {
+        // An SSE error can finish a request before the HTTP body reaches EOF.
+        // The later body completion must not turn that failure into a success.
+        if self
+            .recent
+            .iter()
+            .any(|request| request.request_id == request_id)
+        {
+            return;
+        }
         let mut active = self
             .active
             .remove(request_id)

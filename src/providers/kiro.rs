@@ -22,8 +22,9 @@ use crate::{
 };
 
 // The gateway waits for Kiro before sending headers. Buffered responses wait
-// for the entire generation; cutting them off at 60s starts needless retries.
-const GATEWAY_TIMEOUT: Duration = Duration::from_secs(300);
+// for the entire generation. Allow the gateway's 300s upstream inactivity
+// deadline to return its error before the local connection deadline expires.
+const GATEWAY_TIMEOUT: Duration = Duration::from_secs(330);
 
 #[derive(Deserialize)]
 struct Accounts {

@@ -333,17 +333,18 @@ def proxy_binary():
 
 
 def apply_gateway_patch():
-    """Apply our pinned refusal fix once, preserving unrelated gateway changes."""
+    """Apply pinned gateway fixes once, preserving unrelated gateway changes."""
     with locked("gateway-patch.lock"):
-        patch_file = ROOT / "patches" / "kiro-refusals.patch"
         command = ["git", "apply", "--whitespace=nowarn"]
-        if subprocess.run([*command, "--reverse", "--check", str(patch_file)], cwd=GATEWAY,
-                          capture_output=True).returncode == 0:
-            return
-        if subprocess.run([*command, "--check", str(patch_file)], cwd=GATEWAY,
-                          capture_output=True).returncode != 0:
-            raise RuntimeError("Kiro gateway source does not match its pinned refusal patch; resolve local gateway edits before starting.")
-        subprocess.run([*command, str(patch_file)], cwd=GATEWAY, check=True)
+        for filename in ("kiro-refusals.patch", "kiro-streaming.patch"):
+            patch_file = ROOT / "patches" / filename
+            if subprocess.run([*command, "--reverse", "--check", str(patch_file)], cwd=GATEWAY,
+                              capture_output=True).returncode == 0:
+                continue
+            if subprocess.run([*command, "--check", str(patch_file)], cwd=GATEWAY,
+                              capture_output=True).returncode != 0:
+                raise RuntimeError(f"Kiro gateway source does not match {filename}; resolve local gateway edits before starting.")
+            subprocess.run([*command, str(patch_file)], cwd=GATEWAY, check=True)
 
 
 def gateway_env(account, folder):
@@ -353,7 +354,7 @@ def gateway_env(account, folder):
            ("REFRESH_TOKEN", "PROFILE_ARN", "PROXY_API_KEY", "ACCOUNT_SYSTEM", "DEBUG_MODE")}
     env.update({"PROXY_API_KEY": account["apiKey"], "SERVER_HOST": "127.0.0.1",
                 "SERVER_PORT": str(account["port"]), "ACCOUNT_SYSTEM": "false", "DEBUG_MODE": "off",
-                "FAKE_REASONING": "false",
+                "FAKE_REASONING": "false", "STREAMING_READ_TIMEOUT": "300",
                 "ACCOUNTS_CONFIG_FILE": str(folder / "gateway-accounts.json"),
                 "ACCOUNTS_STATE_FILE": str(folder / "gateway-state.json")})
     return env
@@ -537,7 +538,8 @@ def claude_route_env():
     """Identify our account-authenticated local endpoint during CLI bootstrap too."""
     return {"ANTHROPIC_BASE_URL": f"http://127.0.0.1:{CAVE_PORT}/w/claude",
             "ANTHROPIC_AUTH_TOKEN": "unused",
-            "_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL": "0"}
+            "_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL": "0",
+            "CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK": "1"}
 
 
 def launch_env():

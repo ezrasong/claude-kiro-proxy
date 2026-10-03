@@ -168,6 +168,13 @@ where
 
     fn fail_at(&mut self, stage: &str, kind: &str) -> Bytes {
         self.error_sent = true;
+        if let Some(monitor) = self.monitor.as_ref() {
+            monitor.request_failed(
+                &self.req_id,
+                None,
+                format!("{} Messages stream failed ({stage}: {kind})", self.provider),
+            );
+        }
         if let Some(capture) = self.stream_capture.as_mut() {
             capture.malformed(stage, kind);
         }
@@ -300,6 +307,41 @@ mod tests {
         assert_eq!(text.matches("event: ping\n").count(), 2);
         assert!(text.contains("Test Messages stream is invalid"));
         assert!(!text.contains("event: message_stop\n"));
+    }
+
+    #[tokio::test]
+    async fn stream_error_remains_failed_when_the_http_body_finishes() {
+        use crate::monitor::{EndpointKind, RequestStatus};
+        let monitor = MonitorHandle::default();
+        monitor.request_started("failed-stream", None, None, EndpointKind::Messages);
+        let upstream = futures_util::stream::iter([
+            Ok(Bytes::from_static(
+                b"event: message_start\ndata: {\"type\":\"message_start\"}\n\n",
+            )),
+            Err(std::io::Error::other("upstream timeout")),
+        ]);
+        let body = stream_body(
+            upstream,
+            "Kiro",
+            Some(monitor.clone()),
+            "failed-stream".into(),
+            None,
+        );
+        let bytes = body.collect().await.unwrap().to_bytes();
+        assert!(String::from_utf8_lossy(&bytes).contains("event: error"));
+        // The server's body wrapper reports HTTP EOF even after an SSE error.
+        monitor.request_completed("failed-stream", 200, None, None);
+        let snapshot = monitor.snapshot();
+        assert!(snapshot.active.is_empty());
+        assert_eq!(snapshot.recent.len(), 1);
+        assert_eq!(snapshot.recent[0].status, RequestStatus::Failed);
+        assert!(
+            snapshot.recent[0]
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("transport: upstream_stream")
+        );
     }
 
     #[tokio::test]

@@ -175,7 +175,7 @@ async fn slow_gateway_headers_do_not_restart_generation_but_remain_bounded() {
         // network I/O under an automatically advancing paused clock.
         tokio::time::pause();
         tokio::time::advance(std::time::Duration::from_secs(if expire {
-            301
+            331
         } else {
             75
         }))

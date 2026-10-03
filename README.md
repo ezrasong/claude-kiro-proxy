@@ -59,8 +59,9 @@ macOS/Linux: use `python3` and `source scripts/activate.sh` in Bash.
 
 This repo retains the upstream Claude proxy's code and history (MIT).
 Kiro Gateway is a pinned submodule and separate HTTP service (AGPL-3.0), with a
-tracked patch that reports service refusals instead of empty responses. Setup
-applies the patch automatically. Its synthetic reasoning injection is disabled.
+tracked patches that report service refusals, reject empty responses, and keep
+idle streams connected. Setup applies the patches automatically. Its synthetic
+reasoning injection is disabled.
 Both projects' source and license notices are preserved.
 See [the upstream README](docs/UPSTREAM-README.md) for the original providers.
 

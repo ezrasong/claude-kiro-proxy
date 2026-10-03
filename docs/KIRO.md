@@ -245,8 +245,9 @@ caveman claude --continue --model kiro:claude-opus-5-5 --settings '{"autoCompact
 ```
 
 Kiro's buffered endpoint returns headers only after generation finishes. The
-adapter allows up to five minutes for headers and up to five minutes of upstream
-read inactivity. Its former one-minute header cutoff could cause a healthy long
+adapter allows up to 330 seconds for headers and local gateway read inactivity,
+giving the gateway's 300-second Kiro read deadline time to report an error.
+Its former one-minute header cutoff could cause a healthy long
 generation to fail and be repeated by the client. These limits remain bounded;
 the adapter does not retry or switch accounts. This fix avoids premature retries,
 but does not accelerate Kiro's model generation itself.
@@ -286,11 +287,19 @@ console output, `stack.log` the background supervisor, and
 worker becoming ready. Select another account or import a fresh login. Codex
 sessions do not wait for Kiro readiness.
 
-Kiro can pause while reasoning or preparing tool calls. The main proxy sends
+Kiro can pause while reasoning or preparing tool calls. The gateway and main proxy send
 Anthropic SSE `ping` events every 15 seconds during silence between complete
-frames, keeping the Claude Code connection active through Caveman. Upstream
+frames, keeping both local HTTP connections active through Caveman. A gateway
+ping does not cancel the pending Kiro read or start a second request. Upstream
 timeouts and stream validation still apply; keepalives do not retry requests or
 switch accounts.
+
+The launcher disables Claude Code's automatic non-streaming fallback, which can
+repeat a stalled streamed generation and duplicate tool calls. Claude's ordinary
+API retry limits still apply. An empty Kiro response with no content or tools is
+an API error, rather than successful task completion. Stream failures remain
+failed in the dashboard even after the HTTP body closes. Restart Claude with
+`--continue` after a launcher update to load its new session environment.
 
 The gateway's synthetic reasoning feature is disabled (`FAKE_REASONING=false`).
 It adds instructions asking for exposed thinking, which can cause Kiro to refuse
@@ -298,8 +307,9 @@ ordinary Claude Code conversations with `CONTENT_FILTERED / REASONING_EXTRACTION
 Effort settings do not provide native extended-thinking support through this gateway.
 The proxy preserves tool results and user text without adding continuation prompts.
 
-Setup and service startup apply `patches/kiro-refusals.patch` to the pinned gateway.
-This patch surfaces Kiro refusal metadata as a visible explanation and a `refusal`
+Setup and service startup apply `patches/kiro-refusals.patch` and
+`patches/kiro-streaming.patch` to the pinned gateway. The refusal patch surfaces
+Kiro refusal metadata as a visible explanation and a `refusal`
 stop reason (OpenAI: `content_filter`), instead of an empty success. The gateway,
 main proxy and completion checker do not retry refusals or route them to another
 account. Claude Code may make its own built-in recovery attempt before reporting

@@ -305,6 +305,7 @@ class StackTests(unittest.TestCase):
                 self.assertEqual(settings["env"]["ANTHROPIC_BASE_URL"], "http://127.0.0.1:18764/w/claude")
                 self.assertEqual(settings["env"]["ANTHROPIC_AUTH_TOKEN"], "unused")
                 self.assertEqual(settings["env"]["_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL"], "0")
+                self.assertEqual(settings["env"]["CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK"], "1")
                 self.assertEqual(settings["env"]["EXAMPLE"], "preserved")
                 self.assertEqual(settings["permissions"], original["permissions"])
                 self.assertEqual(settings["hooks"]["Stop"][:-1], original["hooks"]["Stop"])
@@ -338,6 +339,7 @@ class StackTests(unittest.TestCase):
             self.assertEqual(environment["ANTHROPIC_BASE_URL"], "http://127.0.0.1:18764/w/claude")
             self.assertEqual(environment["ANTHROPIC_AUTH_TOKEN"], "unused")
             self.assertEqual(environment["_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL"], "0")
+            self.assertEqual(environment["CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK"], "1")
             for name, value in inherited.items():
                 self.assertEqual(os.environ[name], value)
 
@@ -381,6 +383,7 @@ class StackTests(unittest.TestCase):
         with patch.dict(os.environ, {"FAKE_REASONING": "true", "REFRESH_TOKEN": "other-account", "KIRO_TOKEN": "other", "ACCOUNTS_CONFIG_FILE": "other.json"}):
             env = stack.gateway_env({"apiKey": "account-key", "port": 18770}, folder)
         self.assertEqual(env["FAKE_REASONING"], "false")
+        self.assertEqual(env["STREAMING_READ_TIMEOUT"], "300")
         self.assertEqual(env["PROXY_API_KEY"], "account-key")
         self.assertEqual(env["ACCOUNTS_CONFIG_FILE"], str(folder / "gateway-accounts.json"))
         self.assertEqual(env["ACCOUNTS_STATE_FILE"], str(folder / "gateway-state.json"))
@@ -397,10 +400,13 @@ class StackTests(unittest.TestCase):
         patches = self.root / "patches"
         patches.mkdir()
         (patches / "kiro-refusals.patch").write_text("diff --git a/sample.txt b/sample.txt\n--- a/sample.txt\n+++ b/sample.txt\n@@ -1 +1 @@\n-original\n+fixed\n")
+        (gateway / "stream.txt").write_text("silent\n")
+        (patches / "kiro-streaming.patch").write_text("diff --git a/stream.txt b/stream.txt\n--- a/stream.txt\n+++ b/stream.txt\n@@ -1 +1 @@\n-silent\n+keepalive\n")
         with patch.object(stack, "ROOT", self.root), patch.object(stack, "GATEWAY", gateway):
             stack.apply_gateway_patch()
             stack.apply_gateway_patch()
             self.assertEqual((gateway / "sample.txt").read_text(), "fixed\n")
+            self.assertEqual((gateway / "stream.txt").read_text(), "keepalive\n")
             (gateway / "sample.txt").write_text("user edit\n")
             with self.assertRaisesRegex(RuntimeError, "resolve local gateway edits"):
                 stack.apply_gateway_patch()
